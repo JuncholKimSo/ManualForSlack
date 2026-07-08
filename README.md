@@ -1,5 +1,55 @@
 # youtube2obsidian
 
+YouTube 영상을 타임스탬프 트랜스크립트로 변환해 Claude로 분석하고 Obsidian에 저장합니다.
+두 가지 사용 방식을 제공합니다:
+
+| 방식 | 위치 | 특징 |
+|---|---|---|
+| **크롬 확장** | [`extension/`](extension/) | YouTube 페이지에서 버튼 한 번으로 실행. 자막 있는 영상 전용 |
+| **Python CLI** | [`youtube2obsidian/`](youtube2obsidian/) | 자막 없는 영상도 Whisper 음성 인식으로 처리 |
+
+---
+
+## 크롬 확장
+
+YouTube 영상을 보다가 툴바 아이콘 → 버튼 클릭이면 끝입니다.
+
+```
+YouTube 영상 페이지 (버튼 클릭)
+   │
+   ▼
+① 자막 추출 (콘텐츠 스크립트) — 타임스탬프 포함, 수동 자막 > 자동 생성 순
+   ▼
+② Claude 분석 (백그라운드에서 Anthropic API 직접 호출, claude-opus-4-8)
+   ▼
+③ Obsidian 저장
+   ├─ 1차: Obsidian "Local REST API" 커뮤니티 플러그인 (Vault에 즉시 저장)
+   └─ 2차: 플러그인 미설정 시 .md 파일 다운로드
+```
+
+### 설치
+
+1. `chrome://extensions` → 우측 상단 **개발자 모드** 켜기
+2. **압축해제된 확장 프로그램을 로드합니다** → 이 저장소의 `extension/` 폴더 선택
+
+### 설정 (확장 옵션 페이지)
+
+| 항목 | 설명 |
+|---|---|
+| Anthropic API 키 | Claude 분석용. 브라우저에만 저장됨 |
+| Local REST API 키/주소 | Obsidian에 **Local REST API** 플러그인 설치 후, 설정에서 "Enable Non-encrypted (HTTP) Server"를 켜고 API 키를 복사 (기본 주소 `http://127.0.0.1:27123`) |
+| Vault 내 저장 폴더 | 기본 `YouTube` |
+| 자막 언어 우선순위 | 기본 `ko,en` |
+
+### 제약
+
+- **자막이 없는 영상은 처리할 수 없습니다** — 브라우저에서는 Whisper 음성 인식이 불가능하므로, 이 경우 아래 Python CLI를 사용하세요.
+- API 키는 `chrome.storage.local`(이 브라우저의 확장 저장소)에 보관됩니다. 개인용 도구 기준으로 설계되었습니다.
+
+---
+
+## Python CLI
+
 YouTube 링크 하나로 다음 파이프라인을 실행하는 CLI 서비스입니다.
 
 ```

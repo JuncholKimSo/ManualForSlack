@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube → Obsidian (Claude 분석)",
+  "version": "0.1.0",
+  "description": "YouTube 영상의 자막을 타임스탬프와 함께 추출하고, Claude로 분석해 Obsidian에 저장합니다.",
+  "permissions": ["storage", "downloads", "activeTab"],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "http://127.0.0.1/*",
+    "https://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YouTube → Obsidian"
+  },
+  "options_page": "options.html"
+}

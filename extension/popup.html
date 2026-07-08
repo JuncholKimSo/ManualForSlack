@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      width: 320px;
+      margin: 0;
+      padding: 16px;
+      background: #fafafa;
+      color: #222;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    #video-title {
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 12px;
+      max-height: 3em;
+      overflow: hidden;
+    }
+    label { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 12px; }
+    button {
+      width: 100%;
+      padding: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      background: #7c3aed;
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { background: #c4b5fd; cursor: default; }
+    #status {
+      margin-top: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      color: #444;
+    }
+    #status.error { color: #dc2626; }
+    #status.success { color: #059669; }
+    .footer { margin-top: 12px; font-size: 11px; }
+    .footer a { color: #7c3aed; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>YouTube → Obsidian</h1>
+  <div id="video-title">영상 확인 중...</div>
+  <label>
+    <input type="checkbox" id="do-analysis" checked />
+    Claude로 분석 포함
+  </label>
+  <button id="run">트랜스크립트 추출 → Obsidian 저장</button>
+  <div id="status"></div>
+  <div class="footer"><a id="open-options">⚙️ 설정 (API 키 / Vault)</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>
