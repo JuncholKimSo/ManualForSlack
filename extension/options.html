@@ -83,6 +83,17 @@
   <h2>음성 인식 (Whisper) — 로컬 서버</h2>
   <label for="serverUrl">로컬 서버 주소</label>
   <input type="text" id="serverUrl" placeholder="http://127.0.0.1:8765" />
+
+  <label for="whisperModel">Whisper 모델 (인식 품질)</label>
+  <select id="whisperModel">
+    <option value="small">small — 빠름, 기본</option>
+    <option value="medium">medium — 품질↑, 속도↓</option>
+    <option value="large-v3">large-v3 — 최고 품질, 가장 느림</option>
+  </select>
+  <div class="hint">
+    자동 자막 품질이 낮은 영상은 medium 이상을 권장합니다. 모델은 처음 사용할 때
+    한 번 다운로드됩니다 (medium 약 1.5GB, large-v3 약 3GB).
+  </div>
   <div class="hint">
     자막이 없거나 음성을 직접 받아적고 싶을 때 사용합니다. 터미널에서
     <code>yt2obsidian-server</code>를 실행해두고, 팝업에서 "음성 인식(Whisper) 사용"을 켜세요.

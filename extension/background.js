@@ -33,6 +33,14 @@ const SYSTEM_PROMPT = `당신은 YouTube 영상 트랜스크립트를 분석해 
 타임스탬프는 반드시 입력에 실제로 존재하는 시각만 사용하세요. 내용을 지어내지 마세요.
 제목/헤더 외에 불필요한 서두나 맺음말은 쓰지 마세요.`;
 
+const POLISH_SYSTEM = `당신은 음성 인식 자막 교정 전문가입니다.
+[타임스탬프]가 붙은 자막 문단들을 받아, 각 문단을 읽기 좋은 글로 교정하세요:
+- 문맥상 잘못 인식된 단어를 바로잡기
+- 문장부호(마침표, 쉼표, 물음표)와 띄어쓰기 추가
+- 어색하게 끊긴 문장을 자연스럽게 잇기
+규칙: 내용을 추가·삭제·요약하지 마세요. 각 줄 맨 앞의 [타임스탬프]를 그대로 유지하고,
+줄 수와 순서를 입력과 동일하게 유지하세요. 교정된 줄들만 출력하세요.`;
+
 const MAX_TRANSCRIPT_CHARS = 350_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -57,6 +65,7 @@ async function getSettings() {
     languages: "ko,en",
     doAnalysis: true,
     serverUrl: "http://127.0.0.1:8765",
+    whisperModel: "small",
   };
   const stored = await chrome.storage.local.get(defaults);
   return { ...defaults, ...stored };
@@ -95,6 +104,88 @@ async function extractViaContentScript(tabId, videoId, languages) {
   }
 }
 
+// ---------- Claude 자막 교정 ----------
+
+async function callClaude(settings, system, userText, signal) {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    signal,
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": settings.anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: settings.model || DEFAULT_MODEL,
+      max_tokens: 16000,
+      thinking: { type: "adaptive" },
+      system,
+      messages: [{ role: "user", content: userText }],
+    }),
+  });
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const err = await resp.json();
+      detail = err?.error?.message || detail;
+    } catch (_) {
+      /* 본문이 JSON이 아니면 상태 코드만 표시 */
+    }
+    throw new Error(`Claude API 오류: ${detail}`);
+  }
+  const data = await resp.json();
+  if (data.stop_reason === "refusal") {
+    throw new Error("Claude가 이 콘텐츠의 처리를 거부했습니다.");
+  }
+  return data.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+}
+
+/** 자동 자막(무문장부호·오인식)을 Claude로 문단 단위 교정한다.
+ *  긴 영상은 출력 한도를 넘지 않도록 조각으로 나눠 순차 처리. */
+async function polishTranscript(settings, grouped, signal, onChunk) {
+  if (!settings.anthropicApiKey) {
+    throw new Error("Anthropic API 키가 설정되지 않았습니다. 확장 옵션에서 설정하세요.");
+  }
+  const lines = grouped.map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`);
+
+  // 청크당 약 9,000자 — 응답(교정문)이 max_tokens를 넘지 않게 보수적으로.
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+  for (const line of lines) {
+    if (currentLen + line.length > 9000 && current.length > 0) {
+      chunks.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(line);
+    currentLen += line.length;
+  }
+  if (current.length > 0) chunks.push(current);
+
+  const polished = grouped.map((s) => ({ ...s }));
+  let offset = 0;
+  for (let c = 0; c < chunks.length; c++) {
+    onChunk?.(c + 1, chunks.length);
+    throwIfAborted(signal);
+    const output = await callClaude(settings, POLISH_SYSTEM, chunks[c].join("\n"), signal);
+    const outLines = output.split("\n").filter((l) => l.trim());
+    for (let i = 0; i < chunks[c].length; i++) {
+      const m = (outLines[i] || "").match(/^\[[\d:]+\]\s*(.+)$/);
+      // 교정 결과가 형식에 안 맞으면 해당 문단은 원문 유지 (내용 유실 방지)
+      if (m && m[1].trim()) {
+        polished[offset + i].text = m[1].trim();
+      }
+    }
+    offset += chunks[c].length;
+  }
+  return polished;
+}
+
 // ---------- Claude 분석 ----------
 
 function renderTranscriptForPrompt(segments) {
@@ -116,48 +207,10 @@ async function analyzeWithClaude(settings, { videoId, title, segments }, signal)
   if (!settings.anthropicApiKey) {
     throw new Error("Anthropic API 키가 설정되지 않았습니다. 확장 옵션에서 설정하세요.");
   }
-
   const userMessage =
     `영상 제목: ${title}\n영상 URL: https://www.youtube.com/watch?v=${videoId}\n\n` +
     `<transcript>\n${renderTranscriptForPrompt(segments)}\n</transcript>`;
-
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": settings.anthropicApiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: settings.model || DEFAULT_MODEL,
-      max_tokens: 16000,
-      thinking: { type: "adaptive" },
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMessage }],
-    }),
-  });
-
-  if (!resp.ok) {
-    let detail = `HTTP ${resp.status}`;
-    try {
-      const err = await resp.json();
-      detail = err?.error?.message || detail;
-    } catch (_) {
-      /* 본문이 JSON이 아니면 상태 코드만 표시 */
-    }
-    throw new Error(`Claude API 오류: ${detail}`);
-  }
-
-  const data = await resp.json();
-  if (data.stop_reason === "refusal") {
-    throw new Error("Claude가 이 콘텐츠의 분석을 거부했습니다.");
-  }
-  return data.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("");
+  return callClaude(settings, SYSTEM_PROMPT, userMessage, signal);
 }
 
 // ---------- Obsidian 저장 ----------
@@ -205,37 +258,53 @@ async function saveViaDownload(filename, content) {
 
 // ---------- 파이프라인: 브라우저 자막 경로 ----------
 
-async function runBrowserPipeline(settings, { tabId, videoId, doAnalysis }, signal) {
-  await setJob({ detail: "자막 추출 중...", progress: 10, progressCap: 25, etaSeconds: 8 });
+async function runBrowserPipeline(settings, { tabId, videoId, doAnalysis, doPolish }, signal) {
+  await setJob({ detail: "자막 추출 중...", progress: 8, progressCap: 20, etaSeconds: 8 });
   const languages = settings.languages.split(",").map((s) => s.trim()).filter(Boolean);
   const extracted = await extractViaContentScript(tabId, videoId, languages);
   if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
   throwIfAborted(signal);
 
-  const { title, segments, language, source } = extracted.result;
+  const { title, language, source } = extracted.result;
+  // 이후 단계는 30초 문단 기준으로 처리 (교정 단위 = 노트 문단 = 분석 입력)
+  let segments = groupSegments(extracted.result.segments, 30);
+  const totalChars = segments.reduce((n, s) => n + s.text.length, 0);
   await setJob({
     title,
-    detail: `자막 ${segments.length}개 구간 추출 완료.`,
-    progress: 30,
-    progressCap: 32,
+    detail: `자막 ${segments.length}개 문단 추출 완료.`,
+    progress: 22,
+    progressCap: 24,
   });
+
+  if (doPolish) {
+    const chunkCount = Math.max(1, Math.ceil(totalChars / 9000));
+    await setJob({
+      detail: "자막 교정 중 (Claude)...",
+      progress: 25,
+      progressCap: 55,
+      etaSeconds: chunkCount * 45,
+    });
+    segments = await polishTranscript(settings, segments, signal, (done, total) => {
+      if (total > 1) setJob({ detail: `자막 교정 중 (Claude)... ${done}/${total}` });
+    });
+  }
+  throwIfAborted(signal);
 
   let analysis = null;
   if (doAnalysis) {
     // 분석 시간은 자막 길이에 대략 비례한다 — 예상치를 자막 분량으로 계산.
-    const totalChars = segments.reduce((n, s) => n + s.text.length, 0);
     const analysisEta = Math.round(35 + totalChars / 2500);
     await setJob({
       detail: "Claude 분석 중...",
-      progress: 35,
-      progressCap: 85,
+      progress: 60,
+      progressCap: 88,
       etaSeconds: analysisEta,
     });
     analysis = await analyzeWithClaude(settings, { videoId, title, segments }, signal);
   }
   throwIfAborted(signal);
 
-  await setJob({ detail: "노트 생성 및 저장 중...", progress: 90, progressCap: 96, etaSeconds: 4 });
+  await setJob({ detail: "노트 생성 및 저장 중...", progress: 92, progressCap: 96, etaSeconds: 4 });
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const note = buildNote({ videoId, title, url, segments, language, source, analysis });
   const filename = sanitizeFilename(title);
@@ -262,6 +331,8 @@ async function runServerPipeline(settings, { videoId, doAnalysis }, signal) {
         url: `https://www.youtube.com/watch?v=${videoId}`,
         use_whisper: true,
         do_analysis: doAnalysis,
+        whisper_model: settings.whisperModel || "small",
+        model: settings.model || DEFAULT_MODEL,
       }),
     });
   } catch (e) {

@@ -116,14 +116,21 @@ async function run() {
   }
 
   const doAnalysis = $("do-analysis").checked;
+  const doPolish = $("do-polish").checked;
   const useWhisper = $("use-whisper").checked;
-  await chrome.storage.local.set({ useWhisper });
+  await chrome.storage.local.set({ useWhisper, doPolish });
 
   // 시작 신호만 보낸다 — 이후는 백그라운드가 알아서 진행.
   chrome.runtime
     .sendMessage({
       type: "startPipeline",
-      payload: { tabId: found.tab.id, videoId: found.videoId, doAnalysis, useWhisper },
+      payload: {
+        tabId: found.tab.id,
+        videoId: found.videoId,
+        doAnalysis,
+        doPolish,
+        useWhisper,
+      },
     })
     .catch(() => {});
 
@@ -140,11 +147,13 @@ async function init() {
   });
   $("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-  const { useWhisper, lastJob } = await chrome.storage.local.get({
+  const { useWhisper, doPolish, lastJob } = await chrome.storage.local.get({
     useWhisper: false,
+    doPolish: false,
     lastJob: null,
   });
   $("use-whisper").checked = useWhisper;
+  $("do-polish").checked = doPolish;
 
   const found = await getActiveYouTubeTab();
   if (found) {
