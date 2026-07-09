@@ -208,10 +208,14 @@ async function extractTranscript(videoId, languages) {
   );
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "extractTranscript") return false;
-  extractTranscript(message.videoId, message.languages || ["ko", "en"])
-    .then((result) => sendResponse({ ok: true, result }))
-    .catch((e) => sendResponse({ ok: false, error: e.message }));
-  return true; // 비동기 응답
-});
+// 팝업이 스크립트를 재주입할 수 있으므로 리스너 중복 등록을 막는다.
+if (!window.__yt2obsidianLoaded) {
+  window.__yt2obsidianLoaded = true;
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "extractTranscript") return false;
+    extractTranscript(message.videoId, message.languages || ["ko", "en"])
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true; // 비동기 응답
+  });
+}

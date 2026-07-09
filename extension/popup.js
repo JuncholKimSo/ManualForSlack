@@ -38,12 +38,26 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "status") setStatus(message.status);
 });
 
+/** 콘텐츠 스크립트에 메시지를 보낸다. 스크립트가 없으면(확장 설치/업데이트
+ *  전에 열린 탭) 직접 주입한 뒤 한 번 재시도한다. */
+async function sendToContentScript(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (_) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"],
+    });
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 /** 기본 경로: 브라우저 자막 추출 → 백그라운드 처리 */
 async function runViaBrowser(found, doAnalysis) {
   const { languages } = await chrome.storage.local.get({ languages: "ko,en" });
 
   setStatus("자막 추출 중...");
-  const extracted = await chrome.tabs.sendMessage(found.tab.id, {
+  const extracted = await sendToContentScript(found.tab.id, {
     type: "extractTranscript",
     videoId: found.videoId,
     languages: languages.split(",").map((s) => s.trim()).filter(Boolean),
