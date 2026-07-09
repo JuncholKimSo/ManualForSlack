@@ -154,15 +154,26 @@ async function saveViaRestApi(settings, filename, content) {
   const notePath = folder ? `${folder}/${filename}.md` : `${filename}.md`;
   const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
 
+  // 플러그인 설정 화면의 "Bearer <키>" 표기를 통째로 복사해 넣는 경우가
+  // 흔하므로, 접두어와 앞뒤 공백을 제거해 순수 키만 사용한다.
+  const apiKey = settings.obsidianApiKey.trim().replace(/^bearer\s+/i, "");
+
   const resp = await fetch(`${base}/vault/${encodedPath}`, {
     method: "PUT",
     headers: {
-      Authorization: `Bearer ${settings.obsidianApiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "text/markdown",
     },
     body: content,
   });
   if (!resp.ok) {
+    if (resp.status === 401) {
+      throw new Error(
+        "Obsidian 인증 실패 (401): 확장 옵션의 Local REST API 키가 플러그인의 " +
+          "키와 다릅니다. 플러그인 설정에서 키(긴 영숫자 문자열만, 'Bearer' 단어 제외)를 " +
+          "다시 복사해 넣으세요."
+      );
+    }
     throw new Error(`Obsidian REST API 오류 (HTTP ${resp.status})`);
   }
   return notePath;
