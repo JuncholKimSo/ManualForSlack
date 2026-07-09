@@ -59,6 +59,15 @@ function findFirstKey(node, key) {
   return undefined;
 }
 
+/** HTML에서 캡처한 JSON 문자열 값의 이스케이프(= 등)를 원래 문자로 되돌린다. */
+function decodeJsonString(s) {
+  try {
+    return JSON.parse(`"${s}"`);
+  } catch (_) {
+    return s;
+  }
+}
+
 /** 1차 경로: YouTube 내부 get_transcript API.
  *  watch 페이지의 ytInitialData에 들어 있는 params를 그대로 사용한다. */
 async function fetchViaGetTranscript(html) {
@@ -74,18 +83,21 @@ async function fetchViaGetTranscript(html) {
 
   const url =
     "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false" +
-    (apiKey ? `&key=${apiKey}` : "");
+    (apiKey ? `&key=${decodeJsonString(apiKey)}` : "");
 
   const resp = await fetch(url, {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      context: { client: { clientName: "WEB", clientVersion } },
-      params: paramsMatch[1],
+      context: { client: { clientName: "WEB", clientVersion: decodeJsonString(clientVersion) } },
+      params: decodeJsonString(paramsMatch[1]),
     }),
   });
-  if (!resp.ok) throw new Error(`get_transcript 실패 (HTTP ${resp.status})`);
+  if (!resp.ok) {
+    const snippet = (await resp.text().catch(() => "")).slice(0, 150);
+    throw new Error(`get_transcript 실패 (HTTP ${resp.status}${snippet ? `: ${snippet}` : ""})`);
+  }
 
   const data = await resp.json();
   const segList = findFirstKey(data, "transcriptSegmentListRenderer");
@@ -159,6 +171,35 @@ async function fetchViaTimedtext(tracks, languages) {
   return { segments, language: track.languageCode, auto: track.kind === "asr" };
 }
 
+/** 3차 경로(폴백): InnerTube player API를 ANDROID 클라이언트로 호출.
+ *  이 경로의 자막 URL은 토큰(pot) 요구가 없는 것으로 알려져 있다. */
+async function fetchViaAndroidPlayer(videoId, languages) {
+  const resp = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "ANDROID",
+            clientVersion: "20.10.38",
+            androidSdkVersion: 30,
+          },
+        },
+        videoId,
+      }),
+    }
+  );
+  if (!resp.ok) throw new Error(`player API 실패 (HTTP ${resp.status})`);
+  const data = await resp.json();
+  const tracks =
+    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  if (tracks.length === 0) throw new Error("player API에 자막 트랙이 없습니다.");
+  return fetchViaTimedtext(tracks, languages);
+}
+
 async function extractTranscript(videoId, languages) {
   const html = await fetchWatchHtml(videoId);
   const player = parsePlayerResponse(html);
@@ -166,8 +207,9 @@ async function extractTranscript(videoId, languages) {
   const tracks =
     player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
 
-  // 1차: get_transcript (현재 YouTube에서 가장 안정적인 경로)
-  let primaryError = null;
+  const errors = [];
+
+  // 1차: get_transcript (YouTube 웹 '스크립트 표시' 패널과 같은 경로)
   try {
     const segments = await fetchViaGetTranscript(html);
     if (segments) {
@@ -179,11 +221,12 @@ async function extractTranscript(videoId, languages) {
         source: "youtube-transcript-panel",
       };
     }
+    errors.push("트랜스크립트 패널 없음");
   } catch (e) {
-    primaryError = e;
+    errors.push(e.message);
   }
 
-  // 2차: timedtext 폴백
+  // 2차: 웹 플레이어의 timedtext URL
   if (tracks.length > 0) {
     try {
       const { segments, language, auto } = await fetchViaTimedtext(tracks, languages);
@@ -195,16 +238,27 @@ async function extractTranscript(videoId, languages) {
         source: auto ? "youtube-captions-auto" : "youtube-captions",
       };
     } catch (e) {
-      throw new Error(
-        `자막 추출에 실패했습니다 (${primaryError?.message || "패널 없음"} / ${e.message}). ` +
-          "팝업의 '음성 인식(Whisper) 사용'을 켜고 로컬 서버로 처리해보세요."
-      );
+      errors.push(e.message);
     }
   }
 
+  // 3차: ANDROID 클라이언트 player API의 timedtext URL
+  try {
+    const { segments, language, auto } = await fetchViaAndroidPlayer(videoId, languages);
+    return {
+      videoId,
+      title,
+      segments,
+      language,
+      source: auto ? "youtube-captions-auto" : "youtube-captions",
+    };
+  } catch (e) {
+    errors.push(e.message);
+  }
+
   throw new Error(
-    "이 영상에는 자막이 없습니다. 팝업의 '음성 인식(Whisper) 사용'을 켜고 " +
-      "로컬 서버(yt2obsidian-server)로 처리하세요."
+    `자막 추출에 실패했습니다 (${errors.join(" / ")}). ` +
+      "팝업의 '음성 인식(Whisper) 사용'을 켜고 로컬 서버로 처리해보세요."
   );
 }
 
