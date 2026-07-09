@@ -32,6 +32,29 @@
       cursor: pointer;
     }
     button:disabled { background: #c4b5fd; cursor: default; }
+    #progress-wrap {
+      display: none;
+      margin-top: 12px;
+      height: 8px;
+      background: #e9e4f8;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #progress-bar {
+      height: 100%;
+      width: 0%;
+      background: #7c3aed;
+      border-radius: 4px;
+      transition: width 0.4s ease;
+    }
+    #progress-label {
+      display: none;
+      margin-top: 4px;
+      font-size: 11px;
+      color: #7c3aed;
+      font-weight: 600;
+      text-align: right;
+    }
     #status {
       margin-top: 12px;
       font-size: 12px;
@@ -57,6 +80,8 @@
     음성 인식(Whisper) 사용 — 로컬 서버 필요
   </label>
   <button id="run">트랜스크립트 추출 → Obsidian 저장</button>
+  <div id="progress-wrap"><div id="progress-bar"></div></div>
+  <div id="progress-label"></div>
   <div id="status"></div>
   <div class="footer"><a id="open-options">⚙️ 설정 (API 키 / Vault)</a></div>
   <script src="popup.js"></script>

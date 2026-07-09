@@ -42,9 +42,28 @@ def _update(job_id: str, **fields) -> None:
         _JOBS[job_id].update(fields)
 
 
+def _video_duration_seconds(url: str) -> int:
+    """예상 시간 계산용 영상 길이(초). 실패하면 0."""
+    try:
+        import yt_dlp
+
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return int(info.get("duration") or 0)
+    except Exception:
+        return 0
+
+
 def _run_job(job_id: str, params: dict) -> None:
     try:
-        _update(job_id, status="running", detail="영상 정보 조회 중...")
+        _update(
+            job_id,
+            status="running",
+            detail="영상 정보 조회 중...",
+            progress=6,
+            progress_cap=12,
+            eta_seconds=10,
+        )
         video_id = extract_video_id(params["url"])
         url = f"https://www.youtube.com/watch?v={video_id}"
         title = fetch_video_title(video_id)
@@ -53,28 +72,46 @@ def _run_job(job_id: str, params: dict) -> None:
         whisper_model = params.get("whisper_model", "small")
 
         if params.get("use_whisper"):
+            duration = _video_duration_seconds(url)
+            # 대략: 다운로드 + small 모델 CPU 인식 ≈ 영상 길이의 절반 + 준비 시간
+            whisper_eta = int(duration * 0.5) + 60 if duration else 240
             _update(
                 job_id,
-                detail="오디오 다운로드 → Whisper 음성 인식 중... "
-                "(영상 길이에 따라 수 분 걸릴 수 있습니다)",
+                detail="오디오 다운로드 → Whisper 음성 인식 중...",
+                progress=15,
+                progress_cap=70,
+                eta_seconds=whisper_eta,
             )
             transcript = transcribe_with_whisper(video_id, model_size=whisper_model)
         else:
-            _update(job_id, detail="자막 추출 중...")
+            _update(job_id, detail="자막 추출 중...", progress=15, progress_cap=30, eta_seconds=10)
             try:
                 transcript = fetch_youtube_captions(video_id, languages=languages)
             except Exception:
-                _update(job_id, detail="자막이 없어 Whisper 음성 인식으로 전환...")
+                _update(
+                    job_id,
+                    detail="자막이 없어 Whisper 음성 인식으로 전환...",
+                    progress=20,
+                    progress_cap=70,
+                    eta_seconds=240,
+                )
                 transcript = transcribe_with_whisper(video_id, model_size=whisper_model)
 
         analysis = None
         if params.get("do_analysis", True):
-            _update(job_id, detail="Claude 분석 중...")
+            total_chars = sum(len(s.text) for s in transcript.segments)
+            _update(
+                job_id,
+                detail="Claude 분석 중...",
+                progress=75,
+                progress_cap=90,
+                eta_seconds=int(35 + total_chars / 2500),
+            )
             analysis = analyze_transcript(
                 transcript, title, model=params.get("model", DEFAULT_MODEL)
             )
 
-        _update(job_id, detail="노트 저장 중...")
+        _update(job_id, detail="노트 저장 중...", progress=93, progress_cap=97, eta_seconds=3)
         note = build_note(transcript, title=title, url=url, analysis=analysis)
         path = save_note(
             note, title=title, vault=_VAULT, subfolder=params.get("subfolder", "YouTube")
@@ -83,6 +120,8 @@ def _run_job(job_id: str, params: dict) -> None:
             job_id,
             status="done",
             detail="완료",
+            progress=100,
+            eta_seconds=0,
             result={
                 "saved_to": str(path),
                 "title": title,

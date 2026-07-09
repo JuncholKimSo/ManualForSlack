@@ -32,22 +32,68 @@ async function getActiveYouTubeTab() {
   return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? { tab, videoId } : null;
 }
 
+let currentJob = null;
+
+function fmtEta(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s >= 90) return `약 ${Math.round(s / 60)}분`;
+  if (s >= 60) return `약 1분 ${s - 60}초`;
+  return `약 ${s}초`;
+}
+
+/** 단계 기준 %에서 시작해, 단계 예상 시간에 맞춰 상한(cap)까지 서서히 채운다. */
+function computePct(job) {
+  const base = job.progress ?? 5;
+  const cap = job.progressCap ?? Math.min(base + 10, 95);
+  const elapsed = (Date.now() - (job.stageStartedAt || job.updatedAt)) / 1000;
+  const stageDuration = Math.max(job.etaSeconds || 60, 10);
+  return Math.min(cap, base + (elapsed * (cap - base)) / stageDuration);
+}
+
+function updateProgressUI() {
+  const job = currentJob;
+  if (!job || job.state !== "running") return;
+  const pct = computePct(job);
+  $("progress-bar").style.width = `${pct}%`;
+
+  let etaText = "";
+  if (typeof job.etaSeconds === "number") {
+    const elapsed = (Date.now() - (job.stageStartedAt || job.updatedAt)) / 1000;
+    const remain = job.etaSeconds - elapsed;
+    etaText = remain > 3 ? ` · 남은 시간 ${fmtEta(remain)}` : " · 곧 완료됩니다";
+  }
+  $("progress-label").textContent = `${Math.round(pct)}%${etaText}`;
+}
+setInterval(updateProgressUI, 500);
+
+function showProgress(visible) {
+  $("progress-wrap").style.display = visible ? "block" : "none";
+  $("progress-label").style.display = visible ? "block" : "none";
+}
+
 function renderJob(job) {
+  currentJob = job;
   if (!job) return;
   const suffix = job.title ? `\n🎬 ${job.title}` : "";
   if (job.state === "running") {
     $("run").disabled = true;
+    showProgress(true);
+    updateProgressUI();
     setStatus(
       `⏳ ${job.detail}${suffix}\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)`
     );
   } else if (job.state === "done") {
     $("run").disabled = false;
+    showProgress(true);
+    $("progress-bar").style.width = "100%";
+    $("progress-label").textContent = "100%";
     setStatus(
       `✅ 저장 완료: ${job.result.savedTo}${job.result.analyzed ? "\n(Claude 분석 포함)" : ""}${suffix}`,
       "success"
     );
   } else if (job.state === "error") {
     $("run").disabled = false;
+    showProgress(false);
     setStatus(`❌ ${job.error}`, "error");
   }
 }
@@ -77,6 +123,7 @@ async function run() {
     .catch(() => {});
 
   $("run").disabled = true;
+  showProgress(true);
   setStatus("⏳ 시작 중...\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)");
 }
 

@@ -51,10 +51,16 @@ async function getSettings() {
   return { ...defaults, ...stored };
 }
 
-/** 진행 상태를 storage에 기록한다 — 팝업이 이걸 구독해서 표시한다. */
+/** 진행 상태를 storage에 기록한다 — 팝업이 이걸 구독해서 표시한다.
+ *  progress(단계 기준 %)가 바뀔 때만 stageStartedAt을 갱신해, 팝업이
+ *  단계 경과 시간으로 진행 바를 부드럽게 채우고 남은 시간을 계산한다. */
 async function setJob(patch) {
   const { lastJob } = await chrome.storage.local.get("lastJob");
-  const job = { ...(lastJob || {}), ...patch, updatedAt: Date.now() };
+  const prev = lastJob || {};
+  const job = { ...prev, ...patch, updatedAt: Date.now() };
+  if (patch.progress !== undefined && patch.progress !== prev.progress) {
+    job.stageStartedAt = Date.now();
+  }
   await chrome.storage.local.set({ lastJob: job });
   return job;
 }
@@ -175,21 +181,34 @@ async function saveViaDownload(filename, content) {
 // ---------- 파이프라인: 브라우저 자막 경로 ----------
 
 async function runBrowserPipeline(settings, { tabId, videoId, doAnalysis }) {
-  await setJob({ detail: "자막 추출 중..." });
+  await setJob({ detail: "자막 추출 중...", progress: 10, progressCap: 25, etaSeconds: 8 });
   const languages = settings.languages.split(",").map((s) => s.trim()).filter(Boolean);
   const extracted = await extractViaContentScript(tabId, videoId, languages);
   if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
 
   const { title, segments, language, source } = extracted.result;
-  await setJob({ title, detail: `자막 ${segments.length}개 구간 추출 완료.` });
+  await setJob({
+    title,
+    detail: `자막 ${segments.length}개 구간 추출 완료.`,
+    progress: 30,
+    progressCap: 32,
+  });
 
   let analysis = null;
   if (doAnalysis) {
-    await setJob({ detail: "Claude 분석 중... (수십 초 걸릴 수 있습니다)" });
+    // 분석 시간은 자막 길이에 대략 비례한다 — 예상치를 자막 분량으로 계산.
+    const totalChars = segments.reduce((n, s) => n + s.text.length, 0);
+    const analysisEta = Math.round(35 + totalChars / 2500);
+    await setJob({
+      detail: "Claude 분석 중...",
+      progress: 35,
+      progressCap: 85,
+      etaSeconds: analysisEta,
+    });
     analysis = await analyzeWithClaude(settings, { videoId, title, segments });
   }
 
-  await setJob({ detail: "노트 생성 및 저장 중..." });
+  await setJob({ detail: "노트 생성 및 저장 중...", progress: 90, progressCap: 96, etaSeconds: 4 });
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const note = buildNote({ videoId, title, url, segments, language, source, analysis });
   const filename = sanitizeFilename(title);
@@ -225,6 +244,7 @@ async function runServerPipeline(settings, { videoId, doAnalysis }) {
   if (!resp.ok) throw new Error(`서버 오류 (HTTP ${resp.status})`);
   const { job_id: jobId } = await resp.json();
 
+  let lastDetail = null;
   while (true) {
     await sleep(2000);
     const job = await (await fetch(`${base}/jobs/${jobId}`)).json();
@@ -236,7 +256,17 @@ async function runServerPipeline(settings, { videoId, doAnalysis }) {
       };
     }
     if (job.status === "error") throw new Error(job.error);
-    await setJob({ detail: job.detail || "처리 중..." });
+    // 같은 단계에서 반복 갱신하면 팝업의 경과 시간 계산이 초기화되므로,
+    // 서버가 보내는 단계 정보가 바뀌었을 때만 기록한다.
+    if (job.detail !== lastDetail) {
+      lastDetail = job.detail;
+      await setJob({
+        detail: job.detail || "처리 중...",
+        progress: job.progress,
+        progressCap: job.progress_cap,
+        etaSeconds: job.eta_seconds,
+      });
+    }
   }
 }
 
@@ -250,9 +280,13 @@ async function startPipeline(payload) {
       videoId: payload.videoId,
       title: null,
       detail: "시작 중...",
+      progress: 3,
+      progressCap: 8,
+      etaSeconds: payload.useWhisper ? 300 : 60,
       result: null,
       error: null,
       updatedAt: Date.now(),
+      stageStartedAt: Date.now(),
     },
   });
 
@@ -260,7 +294,7 @@ async function startPipeline(payload) {
     const result = payload.useWhisper
       ? await runServerPipeline(settings, payload)
       : await runBrowserPipeline(settings, payload);
-    await setJob({ state: "done", detail: "완료", result });
+    await setJob({ state: "done", detail: "완료", result, progress: 100, etaSeconds: 0 });
     notifyUser("YouTube → Obsidian 완료", `저장됨: ${result.savedTo}`);
   } catch (e) {
     await setJob({ state: "error", error: e.message });
