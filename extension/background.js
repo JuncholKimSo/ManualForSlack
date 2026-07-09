@@ -307,6 +307,74 @@ async function savePipelineNote(settings, pipeline) {
   return notePath;
 }
 
+// ---------- 처리 로그 & 가이드 문서 ----------
+
+async function getNoteContent(settings, notePath) {
+  const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
+  const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
+  const resp = await fetch(`${base}/vault/${encodedPath}`, {
+    headers: {
+      Authorization: `Bearer ${obsidianAuthKey(settings)}`,
+      Accept: "text/markdown",
+    },
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`Obsidian REST API 오류 (HTTP ${resp.status})`);
+  return resp.text();
+}
+
+/** 단계 완료를 볼트의 '_처리 로그' 노트에 한 줄 추가한다 (REST 설정 시에만). */
+async function appendProcessLog(settings, stepLabel, result) {
+  if (!settings.obsidianApiKey) return;
+  try {
+    const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
+    const logPath = folder ? `${folder}/_처리 로그.md` : "_처리 로그.md";
+
+    const noteName = (result.savedTo || "")
+      .split("/")
+      .pop()
+      .replace(/\.md$/, "");
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      now.getDate()
+    ).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(
+      now.getMinutes()
+    ).padStart(2, "0")}`;
+    const line = `- ${stamp} · ${stepLabel} · [[${noteName}]]`;
+
+    let content = await getNoteContent(settings, logPath);
+    if (content === null) {
+      content = "# 처리 로그\n\n도구가 실행한 단계를 자동 기록합니다.\n";
+    }
+    await putNote(settings, logPath, content.trimEnd() + "\n" + line + "\n");
+  } catch (_) {
+    // 로그 기록 실패는 본 작업의 성패에 영향을 주지 않는다.
+  }
+}
+
+const GUIDE_DOCS = [
+  { file: "docs/usage.md", note: "YouTube→Obsidian 사용법" },
+  { file: "docs/devlog.md", note: "YouTube→Obsidian 개발 로그" },
+  { file: "docs/changelog.md", note: "YouTube→Obsidian 변경 이력" },
+];
+
+/** 확장에 내장된 가이드 문서 3종을 볼트의 저장 폴더에 설치/갱신한다. */
+async function installGuideDocs() {
+  const settings = await getSettings();
+  if (!settings.obsidianApiKey) {
+    throw new Error("Obsidian Local REST API 키가 필요합니다. 먼저 설정하세요.");
+  }
+  const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
+  const installed = [];
+  for (const doc of GUIDE_DOCS) {
+    const content = await (await fetch(chrome.runtime.getURL(doc.file))).text();
+    const notePath = folder ? `${folder}/${doc.note}.md` : `${doc.note}.md`;
+    await putNote(settings, notePath, content);
+    installed.push(notePath);
+  }
+  return installed;
+}
+
 // ---------- 단계들 ----------
 
 async function stepExtract(settings, { tabId, videoId }, signal) {
@@ -501,6 +569,7 @@ async function runStep(step, payload) {
 
     await setJob({ state: "done", detail: "완료", result, progress: 100, etaSeconds: 0 });
     notifyUser(`${STEP_LABEL[step]} 완료`, `저장됨: ${result.savedTo}`);
+    await appendProcessLog(settings, STEP_LABEL[step], result);
   } catch (e) {
     if (e.name === "AbortError" || abort.signal.aborted) {
       await setJob({ state: "cancelled", detail: "중지됨" });
@@ -542,6 +611,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     cancelPipeline();
     sendResponse({ ok: true });
     return false;
+  }
+  if (message?.type === "installDocs") {
+    installGuideDocs()
+      .then((installed) => sendResponse({ ok: true, installed }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true; // 비동기 응답
   }
   return false;
 });
