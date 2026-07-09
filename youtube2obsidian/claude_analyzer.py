@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import anthropic
 
-from .markdown_builder import format_timestamp
+from .markdown_builder import format_timestamp, group_segments
 from .transcript import Transcript
 
 DEFAULT_MODEL = "claude-opus-4-8"
@@ -35,9 +35,11 @@ SYSTEM_PROMPT = """\
 
 
 def _render_transcript_for_prompt(transcript: Transcript, max_chars: int = 350_000) -> str:
+    # 자동 자막은 2~3초짜리 조각 수백 개로 오기 때문에, 30초 문단으로 묶어
+    # 타임스탬프 줄 수를 줄이면 입력 토큰(비용)이 크게 감소한다.
     lines = [
         f"[{format_timestamp(seg.start)}] {seg.text.strip()}"
-        for seg in transcript.segments
+        for seg in group_segments(transcript.segments, window=30.0)
         if seg.text.strip()
     ]
     text = "\n".join(lines)

@@ -32,6 +32,13 @@
       cursor: pointer;
     }
     button:disabled { background: #c4b5fd; cursor: default; }
+    #stop {
+      display: none;
+      margin-top: 8px;
+      background: #f3f4f6;
+      color: #dc2626;
+      border: 1px solid #e5e7eb;
+    }
     #progress-wrap {
       display: none;
       margin-top: 12px;
@@ -80,6 +87,7 @@
     음성 인식(Whisper) 사용 — 로컬 서버 필요
   </label>
   <button id="run">트랜스크립트 추출 → Obsidian 저장</button>
+  <button id="stop">■ 작업 중지</button>
   <div id="progress-wrap"><div id="progress-bar"></div></div>
   <div id="progress-label"></div>
   <div id="status"></div>

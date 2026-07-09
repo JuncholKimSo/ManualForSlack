@@ -37,9 +37,19 @@ _LOCK = threading.Lock()
 _VAULT: str | None = None  # --vault 인자 (없으면 OBSIDIAN_VAULT_PATH 사용)
 
 
+class _Cancelled(Exception):
+    """사용자가 작업 중지를 요청했다."""
+
+
 def _update(job_id: str, **fields) -> None:
     with _LOCK:
         _JOBS[job_id].update(fields)
+
+
+def _check_cancel(job_id: str) -> None:
+    with _LOCK:
+        if _JOBS[job_id].get("cancel_requested"):
+            raise _Cancelled()
 
 
 def _video_duration_seconds(url: str) -> int:
@@ -67,6 +77,7 @@ def _run_job(job_id: str, params: dict) -> None:
         video_id = extract_video_id(params["url"])
         url = f"https://www.youtube.com/watch?v={video_id}"
         title = fetch_video_title(video_id)
+        _check_cancel(job_id)
 
         languages = params.get("languages") or ["ko", "en"]
         whisper_model = params.get("whisper_model", "small")
@@ -97,6 +108,7 @@ def _run_job(job_id: str, params: dict) -> None:
                 )
                 transcript = transcribe_with_whisper(video_id, model_size=whisper_model)
 
+        _check_cancel(job_id)  # Whisper 인식 완료 직후 (분석 시작 전 = 비용 발생 전)
         analysis = None
         if params.get("do_analysis", True):
             total_chars = sum(len(s.text) for s in transcript.segments)
@@ -111,6 +123,7 @@ def _run_job(job_id: str, params: dict) -> None:
                 transcript, title, model=params.get("model", DEFAULT_MODEL)
             )
 
+        _check_cancel(job_id)
         _update(job_id, detail="노트 저장 중...", progress=93, progress_cap=97, eta_seconds=3)
         note = build_note(transcript, title=title, url=url, analysis=analysis)
         path = save_note(
@@ -130,6 +143,8 @@ def _run_job(job_id: str, params: dict) -> None:
                 "source": transcript.source,
             },
         )
+    except _Cancelled:
+        _update(job_id, status="cancelled", detail="사용자가 중지했습니다.")
     except ImportError:
         _update(
             job_id,
@@ -172,6 +187,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        # 작업 중지: POST /jobs/<id>/cancel
+        if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):
+            job_id = self.path.removeprefix("/jobs/").removesuffix("/cancel")
+            with _LOCK:
+                job = _JOBS.get(job_id)
+                if job is not None and job["status"] in ("queued", "running"):
+                    job["cancel_requested"] = True
+            self._send(200, {"ok": True})
+            return
+
         if self.path != "/jobs":
             self._send(404, {"error": "not found"})
             return
@@ -186,7 +211,13 @@ class Handler(BaseHTTPRequestHandler):
 
         job_id = uuid.uuid4().hex[:12]
         with _LOCK:
-            _JOBS[job_id] = {"status": "queued", "detail": "대기 중...", "result": None, "error": None}
+            _JOBS[job_id] = {
+                "status": "queued",
+                "detail": "대기 중...",
+                "result": None,
+                "error": None,
+                "cancel_requested": False,
+            }
         threading.Thread(target=_run_job, args=(job_id, params), daemon=True).start()
         self._send(202, {"job_id": job_id})
 

@@ -75,6 +75,7 @@ function renderJob(job) {
   currentJob = job;
   if (!job) return;
   const suffix = job.title ? `\n🎬 ${job.title}` : "";
+  $("stop").style.display = job.state === "running" ? "block" : "none";
   if (job.state === "running") {
     $("run").disabled = true;
     showProgress(true);
@@ -91,6 +92,10 @@ function renderJob(job) {
       `✅ 저장 완료: ${job.result.savedTo}${job.result.analyzed ? "\n(Claude 분석 포함)" : ""}${suffix}`,
       "success"
     );
+  } else if (job.state === "cancelled") {
+    $("run").disabled = false;
+    showProgress(false);
+    setStatus("⏹ 작업을 중지했습니다.");
   } else if (job.state === "error") {
     $("run").disabled = false;
     showProgress(false);
@@ -129,6 +134,10 @@ async function run() {
 
 async function init() {
   $("run").addEventListener("click", run);
+  $("stop").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "cancelPipeline" }).catch(() => {});
+    setStatus("⏹ 중지 요청 중...");
+  });
   $("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
   const { useWhisper, lastJob } = await chrome.storage.local.get({
