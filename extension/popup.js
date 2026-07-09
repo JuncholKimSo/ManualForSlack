@@ -1,7 +1,5 @@
-// 팝업: 단계 선택형 실행 UI.
-//   ① 추출(자막/Whisper) → ② 자막 교정(선택) → ③ Claude 분석(선택)
-// 각 단계는 백그라운드가 수행하며 같은 노트를 갱신한다.
-// 팝업/창을 닫아도 진행되고, 다시 열면 상태가 복원된다.
+// 팝업: 현재 탭 영상의 파이프라인을 보여주고 단계를 실행한다.
+// 서로 다른 영상의 작업은 동시에 진행 가능 — 다른 영상 작업은 하단에 요약 표시.
 
 const $ = (id) => document.getElementById(id);
 
@@ -33,11 +31,18 @@ async function getActiveYouTubeTab() {
   return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? { tab, videoId } : null;
 }
 
-// ---------- 진행 표시 ----------
+// ---------- 상태 ----------
 
-let currentJob = null;
-let currentPipeline = null;
-let running = false;
+let currentVideoId = null;
+let currentTabId = null;
+let jobs = {};
+let pipelines = {};
+
+const myJob = () => (currentVideoId ? jobs[currentVideoId] : null);
+const myPipeline = () => (currentVideoId ? pipelines[currentVideoId] : null);
+const isRunning = () => myJob()?.state === "running";
+
+// ---------- 진행 표시 ----------
 
 function fmtEta(seconds) {
   const s = Math.max(0, Math.round(seconds));
@@ -55,7 +60,7 @@ function computePct(job) {
 }
 
 function updateProgressUI() {
-  const job = currentJob;
+  const job = myJob();
   if (!job || job.state !== "running") return;
   const pct = computePct(job);
   $("progress-bar").style.width = `${pct}%`;
@@ -75,36 +80,60 @@ function showProgress(visible) {
   $("progress-label").style.display = visible ? "block" : "none";
 }
 
-// ---------- 상태 렌더링 ----------
+// ---------- 렌더링 ----------
 
 function renderButtons() {
-  const hasPipeline = Boolean(currentPipeline);
-  $("run-extract").disabled = running;
-  $("run-whisper").disabled = running;
-  $("run-polish").disabled = running || !hasPipeline;
-  $("run-analyze").disabled = running || !hasPipeline;
+  const running = isRunning();
+  const onVideo = Boolean(currentVideoId);
+  $("run-extract").disabled = !onVideo || running;
+  $("run-whisper").disabled = !onVideo || running;
+  $("run-polish").disabled = !onVideo || running || !myPipeline();
+  $("run-analyze").disabled = !onVideo || running || !myPipeline();
   $("stop").style.display = running ? "block" : "none";
 }
 
 function renderPipeline() {
   const el = $("pipeline-state");
-  if (!currentPipeline) {
+  const p = myPipeline();
+  if (!p) {
     el.textContent = "";
     return;
   }
-  const p = currentPipeline;
   const mark = (done) => (done ? "✅" : "▫️");
   el.textContent =
-    `📄 ${p.title}\n` +
     `${mark(true)} 추출 (${p.segments.length}문단, ${p.source})  ` +
     `${mark(p.polished)} 교정  ${mark(Boolean(p.analysis))} 분석`;
 }
 
-function renderJob(job) {
-  currentJob = job;
-  if (!job) return;
-  running = job.state === "running";
+function renderOtherJobs() {
+  const el = $("other-jobs");
+  const others = Object.values(jobs).filter(
+    (j) => j.state === "running" && j.videoId !== currentVideoId
+  );
+  if (others.length === 0) {
+    el.textContent = "";
+    return;
+  }
+  el.textContent = others
+    .map((j) => `🔄 ${j.title || j.videoId} — ${j.stepLabel || ""} ${j.detail || ""}`)
+    .join("\n");
+}
+
+function renderJobStatus() {
+  const job = myJob();
   renderButtons();
+  renderOtherJobs();
+
+  if (!job) {
+    showProgress(false);
+    return;
+  }
+  // 오래된 완료/오류 상태는 팝업을 어지럽히지 않게 5분까지만 보여준다
+  if (job.state !== "running" && Date.now() - job.updatedAt > 300_000) {
+    showProgress(false);
+    setStatus("");
+    return;
+  }
 
   const label = job.stepLabel ? `[${job.stepLabel}] ` : "";
   if (job.state === "running") {
@@ -127,30 +156,26 @@ function renderJob(job) {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (changes.lastJob) renderJob(changes.lastJob.newValue);
-  if (changes.pipeline) {
-    currentPipeline = changes.pipeline.newValue;
-    renderPipeline();
-    renderButtons();
-  }
+  if (changes.jobs) jobs = changes.jobs.newValue || {};
+  if (changes.pipelines) pipelines = changes.pipelines.newValue || {};
+  renderPipeline();
+  renderJobStatus();
 });
 
 // ---------- 실행 ----------
 
-async function startStep(step) {
-  let payload = {};
-  if (step === "extract" || step === "whisper") {
-    const found = await getActiveYouTubeTab();
-    if (!found) {
-      setStatus("YouTube 영상 페이지에서 실행하세요.", "error");
-      return;
-    }
-    payload = { tabId: found.tab.id, videoId: found.videoId };
+function startStep(step) {
+  if (!currentVideoId) {
+    setStatus("YouTube 영상 페이지에서 실행하세요.", "error");
+    return;
   }
-
-  chrome.runtime.sendMessage({ type: "runStep", step, payload }).catch(() => {});
-  running = true;
-  renderButtons();
+  chrome.runtime
+    .sendMessage({
+      type: "runStep",
+      step,
+      payload: { tabId: currentTabId, videoId: currentVideoId },
+    })
+    .catch(() => {});
   showProgress(true);
   setStatus("⏳ 시작 중...\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)");
 }
@@ -161,31 +186,28 @@ async function init() {
   $("run-polish").addEventListener("click", () => startStep("polish"));
   $("run-analyze").addEventListener("click", () => startStep("analyze"));
   $("stop").addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "cancelPipeline" }).catch(() => {});
+    chrome.runtime
+      .sendMessage({ type: "cancelPipeline", videoId: currentVideoId })
+      .catch(() => {});
     setStatus("⏹ 중지 요청 중...");
   });
   $("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-  const { lastJob, pipeline } = await chrome.storage.local.get({
-    lastJob: null,
-    pipeline: null,
-  });
-  currentPipeline = pipeline;
-  renderPipeline();
+  const stored = await chrome.storage.local.get({ jobs: {}, pipelines: {} });
+  jobs = stored.jobs;
+  pipelines = stored.pipelines;
 
   const found = await getActiveYouTubeTab();
   if (found) {
+    currentVideoId = found.videoId;
+    currentTabId = found.tab.id;
     $("video-title").textContent = `🎬 ${found.tab.title?.replace(/ - YouTube$/, "") || found.videoId}`;
   } else {
     $("video-title").textContent = "YouTube 영상 페이지가 아닙니다.";
   }
 
-  // 진행 중이거나 최근 작업 상태 복원
-  if (lastJob && (lastJob.state === "running" || Date.now() - lastJob.updatedAt < 300_000)) {
-    renderJob(lastJob);
-  } else {
-    renderButtons();
-  }
+  renderPipeline();
+  renderJobStatus();
 }
 
 init();

@@ -1,9 +1,9 @@
-// 백그라운드 서비스 워커: 단계 선택형 파이프라인을 지휘한다.
+// 백그라운드 서비스 워커: 영상별 독립 파이프라인을 지휘한다.
 //   ① 추출 (자막 또는 Whisper) → 노트 저장
 //   ② 자막 교정 (선택)        → 같은 노트 갱신
 //   ③ Claude 분석 (선택)      → 같은 노트 갱신
-// 각 단계는 팝업에서 따로 실행하고, 상태는 chrome.storage에 남아
-// 팝업을 닫아도 이어진다. 완료/오류 시 시스템 알림.
+// 서로 다른 영상의 작업은 동시에 실행할 수 있다 (같은 영상은 한 번에 한 단계).
+// 상태는 chrome.storage에 영상별로 남아 팝업을 닫아도 이어진다.
 //
 // MV3는 원격 코드 로드를 금지하고 이 확장은 번들러 없이 배포되므로,
 // Anthropic SDK 대신 공식 REST API를 직접 호출한다 (CORS는
@@ -54,8 +54,16 @@ function polishSystemPrompt(title) {
 const MAX_TRANSCRIPT_CHARS = 350_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 진행 중인 단계의 중지 핸들 (한 번에 한 단계만 실행)
-let activeRun = null; // { abort: AbortController, serverJob: {base, jobId} | null }
+// 영상별 실행 핸들 — 같은 영상은 한 번에 한 단계, 다른 영상은 동시 실행 가능
+const activeRuns = new Map(); // videoId → { abort: AbortController, serverJob }
+
+// storage 읽기-수정-쓰기 경합 방지용 직렬화 체인
+let storageChain = Promise.resolve();
+function withStore(fn) {
+  const next = storageChain.then(fn, fn);
+  storageChain = next.catch(() => {});
+  return next;
+}
 
 function throwIfAborted(signal) {
   if (signal?.aborted) {
@@ -80,17 +88,35 @@ async function getSettings() {
   return { ...defaults, ...stored };
 }
 
-// ---------- 작업 상태 (팝업 표시용) ----------
+// ---------- 영상별 작업 상태 (팝업 표시용) ----------
 
-async function setJob(patch) {
-  const { lastJob } = await chrome.storage.local.get("lastJob");
-  const prev = lastJob || {};
-  const job = { ...prev, ...patch, updatedAt: Date.now() };
-  if (patch.progress !== undefined && patch.progress !== prev.progress) {
-    job.stageStartedAt = Date.now();
-  }
-  await chrome.storage.local.set({ lastJob: job });
-  return job;
+const JOB_KEEP_MS = 60 * 60 * 1000; // 완료된 작업 표시는 1시간 유지
+
+function pruneMap(map, keep = 12) {
+  const entries = Object.entries(map);
+  if (entries.length <= keep) return map;
+  entries.sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0));
+  return Object.fromEntries(entries.slice(0, keep));
+}
+
+function setJobFor(videoId, patch) {
+  return withStore(async () => {
+    const { jobs } = await chrome.storage.local.get({ jobs: {} });
+    const prev = jobs[videoId] || {};
+    const job = { ...prev, ...patch, videoId, updatedAt: Date.now() };
+    if (patch.progress !== undefined && patch.progress !== prev.progress) {
+      job.stageStartedAt = Date.now();
+    }
+    jobs[videoId] = job;
+    // 오래된 완료/오류 작업 정리
+    for (const [id, j] of Object.entries(jobs)) {
+      if (j.state !== "running" && Date.now() - (j.updatedAt || 0) > JOB_KEEP_MS) {
+        delete jobs[id];
+      }
+    }
+    await chrome.storage.local.set({ jobs: pruneMap(jobs) });
+    return job;
+  });
 }
 
 function notifyUser(title, message) {
@@ -99,15 +125,19 @@ function notifyUser(title, message) {
     .catch(() => {});
 }
 
-// ---------- 파이프라인 상태 (단계 간 공유) ----------
+// ---------- 영상별 파이프라인 상태 (단계 간 공유) ----------
 
-async function getPipeline() {
-  const { pipeline } = await chrome.storage.local.get("pipeline");
-  return pipeline || null;
+async function getPipelineFor(videoId) {
+  const { pipelines } = await chrome.storage.local.get({ pipelines: {} });
+  return pipelines[videoId] || null;
 }
 
-async function setPipeline(pipeline) {
-  await chrome.storage.local.set({ pipeline });
+function setPipelineFor(videoId, pipeline) {
+  return withStore(async () => {
+    const { pipelines } = await chrome.storage.local.get({ pipelines: {} });
+    pipelines[videoId] = { ...pipeline, updatedAt: Date.now() };
+    await chrome.storage.local.set({ pipelines: pruneMap(pipelines, 10) });
+  });
 }
 
 // ---------- 자막 추출 (콘텐츠 스크립트 경유) ----------
@@ -179,8 +209,7 @@ function renderTranscriptForPrompt(segments) {
   return text;
 }
 
-/** 자막 교정: 문단 단위로 Claude가 오인식·문장부호·문장 연결을 다듬는다.
- *  긴 영상은 조각으로 나눠 순차 처리. 결과는 타임스탬프로 매칭한다. */
+/** 자막 교정: 문단 단위로 Claude가 오인식·문장부호·문장 연결을 다듬는다. */
 async function polishTranscript(settings, title, segments, signal, onChunk) {
   const lines = segments.map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`);
 
@@ -246,6 +275,20 @@ async function noteExists(settings, notePath) {
   }
 }
 
+async function getNoteContent(settings, notePath) {
+  const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
+  const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
+  const resp = await fetch(`${base}/vault/${encodedPath}`, {
+    headers: {
+      Authorization: `Bearer ${obsidianAuthKey(settings)}`,
+      Accept: "text/markdown",
+    },
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`Obsidian REST API 오류 (HTTP ${resp.status})`);
+  return resp.text();
+}
+
 async function putNote(settings, notePath, content) {
   const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
   const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
@@ -309,47 +352,32 @@ async function savePipelineNote(settings, pipeline) {
 
 // ---------- 처리 로그 & 가이드 문서 ----------
 
-async function getNoteContent(settings, notePath) {
-  const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
-  const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
-  const resp = await fetch(`${base}/vault/${encodedPath}`, {
-    headers: {
-      Authorization: `Bearer ${obsidianAuthKey(settings)}`,
-      Accept: "text/markdown",
-    },
-  });
-  if (resp.status === 404) return null;
-  if (!resp.ok) throw new Error(`Obsidian REST API 오류 (HTTP ${resp.status})`);
-  return resp.text();
-}
-
 /** 단계 완료를 볼트의 '_처리 로그' 노트에 한 줄 추가한다 (REST 설정 시에만). */
-async function appendProcessLog(settings, stepLabel, result) {
-  if (!settings.obsidianApiKey) return;
-  try {
-    const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
-    const logPath = folder ? `${folder}/_처리 로그.md` : "_처리 로그.md";
+function appendProcessLog(settings, stepLabel, result) {
+  if (!settings.obsidianApiKey) return Promise.resolve();
+  return withStore(async () => {
+    try {
+      const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
+      const logPath = folder ? `${folder}/_처리 로그.md` : "_처리 로그.md";
 
-    const noteName = (result.savedTo || "")
-      .split("/")
-      .pop()
-      .replace(/\.md$/, "");
-    const now = new Date();
-    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-      now.getDate()
-    ).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(
-      now.getMinutes()
-    ).padStart(2, "0")}`;
-    const line = `- ${stamp} · ${stepLabel} · [[${noteName}]]`;
+      const noteName = (result.savedTo || "").split("/").pop().replace(/\.md$/, "");
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+        now.getDate()
+      ).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(
+        now.getMinutes()
+      ).padStart(2, "0")}`;
+      const line = `- ${stamp} · ${stepLabel} · [[${noteName}]]`;
 
-    let content = await getNoteContent(settings, logPath);
-    if (content === null) {
-      content = "# 처리 로그\n\n도구가 실행한 단계를 자동 기록합니다.\n";
+      let content = await getNoteContent(settings, logPath);
+      if (content === null) {
+        content = "# 처리 로그\n\n도구가 실행한 단계를 자동 기록합니다.\n";
+      }
+      await putNote(settings, logPath, content.trimEnd() + "\n" + line + "\n");
+    } catch (_) {
+      // 로그 기록 실패는 본 작업의 성패에 영향을 주지 않는다.
     }
-    await putNote(settings, logPath, content.trimEnd() + "\n" + line + "\n");
-  } catch (_) {
-    // 로그 기록 실패는 본 작업의 성패에 영향을 주지 않는다.
-  }
+  });
 }
 
 const GUIDE_DOCS = [
@@ -377,8 +405,8 @@ async function installGuideDocs() {
 
 // ---------- 단계들 ----------
 
-async function stepExtract(settings, { tabId, videoId }, signal) {
-  await setJob({ detail: "자막 추출 중...", progress: 10, progressCap: 40, etaSeconds: 8 });
+async function stepExtract(settings, { tabId, videoId }, signal, job) {
+  await job({ detail: "자막 추출 중...", progress: 10, progressCap: 40, etaSeconds: 8 });
   const languages = settings.languages.split(",").map((s) => s.trim()).filter(Boolean);
   const extracted = await extractViaContentScript(tabId, videoId, languages);
   if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
@@ -398,16 +426,16 @@ async function stepExtract(settings, { tabId, videoId }, signal) {
     polished: false,
   };
 
-  await setJob({ title, detail: "노트 저장 중...", progress: 70, progressCap: 95, etaSeconds: 4 });
+  await job({ title, detail: "노트 저장 중...", progress: 70, progressCap: 95, etaSeconds: 4 });
   const savedTo = await savePipelineNote(settings, pipeline);
-  await setPipeline(pipeline);
+  await setPipelineFor(videoId, pipeline);
   return { savedTo, title };
 }
 
-async function stepWhisper(settings, { videoId }, signal) {
+async function stepWhisper(settings, { videoId }, signal, job, run) {
   const base = settings.serverUrl.replace(/\/+$/, "");
 
-  await setJob({ detail: "로컬 서버에 작업 요청 중...", progress: 5, progressCap: 10, etaSeconds: 5 });
+  await job({ detail: "로컬 서버에 작업 요청 중...", progress: 5, progressCap: 10, etaSeconds: 5 });
   let resp;
   try {
     resp = await fetch(`${base}/jobs`, {
@@ -431,33 +459,33 @@ async function stepWhisper(settings, { videoId }, signal) {
   }
   if (!resp.ok) throw new Error(`서버 오류 (HTTP ${resp.status})`);
   const { job_id: jobId } = await resp.json();
-  if (activeRun) activeRun.serverJob = { base, jobId };
+  run.serverJob = { base, jobId };
 
-  let job;
+  let serverJobState;
   let lastDetail = null;
   while (true) {
     throwIfAborted(signal);
     await sleep(2000);
-    job = await (await fetch(`${base}/jobs/${jobId}`, { signal })).json();
-    if (job.status === "done") break;
-    if (job.status === "cancelled") {
+    serverJobState = await (await fetch(`${base}/jobs/${jobId}`, { signal })).json();
+    if (serverJobState.status === "done") break;
+    if (serverJobState.status === "cancelled") {
       const e = new Error("사용자가 중지했습니다.");
       e.name = "AbortError";
       throw e;
     }
-    if (job.status === "error") throw new Error(job.error);
-    if (job.detail !== lastDetail) {
-      lastDetail = job.detail;
-      await setJob({
-        detail: job.detail || "처리 중...",
-        progress: job.progress,
-        progressCap: job.progress_cap,
-        etaSeconds: job.eta_seconds,
+    if (serverJobState.status === "error") throw new Error(serverJobState.error);
+    if (serverJobState.detail !== lastDetail) {
+      lastDetail = serverJobState.detail;
+      await job({
+        detail: serverJobState.detail || "처리 중...",
+        progress: serverJobState.progress,
+        progressCap: serverJobState.progress_cap,
+        etaSeconds: serverJobState.eta_seconds,
       });
     }
   }
 
-  const result = job.result;
+  const result = serverJobState.result;
   const segments = groupSegments(result.segments || []);
   if (segments.length === 0) throw new Error("음성 인식 결과가 비어 있습니다.");
 
@@ -473,19 +501,25 @@ async function stepWhisper(settings, { videoId }, signal) {
     polished: false,
   };
 
-  await setJob({ title: result.title, detail: "노트 저장 중...", progress: 92, progressCap: 97, etaSeconds: 4 });
+  await job({
+    title: result.title,
+    detail: "노트 저장 중...",
+    progress: 92,
+    progressCap: 97,
+    etaSeconds: 4,
+  });
   const savedTo = await savePipelineNote(settings, pipeline);
-  await setPipeline(pipeline);
+  await setPipelineFor(videoId, pipeline);
   return { savedTo, title: result.title };
 }
 
-async function stepPolish(settings, signal) {
-  const pipeline = await getPipeline();
-  if (!pipeline) throw new Error("먼저 ① 추출을 실행하세요.");
+async function stepPolish(settings, { videoId }, signal, job) {
+  const pipeline = await getPipelineFor(videoId);
+  if (!pipeline) throw new Error("이 영상은 아직 추출되지 않았습니다. 먼저 ① 추출을 실행하세요.");
 
   const totalChars = pipeline.segments.reduce((n, s) => n + s.text.length, 0);
   const chunkCount = Math.max(1, Math.ceil(totalChars / 9000));
-  await setJob({
+  await job({
     title: pipeline.title,
     detail: "자막 교정 중 (Claude)...",
     progress: 8,
@@ -499,23 +533,23 @@ async function stepPolish(settings, signal) {
     pipeline.segments,
     signal,
     (done, total) => {
-      if (total > 1) setJob({ detail: `자막 교정 중 (Claude)... ${done}/${total}` });
+      if (total > 1) job({ detail: `자막 교정 중 (Claude)... ${done}/${total}` });
     }
   );
   pipeline.polished = true;
 
-  await setJob({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
+  await job({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
   const savedTo = await savePipelineNote(settings, pipeline);
-  await setPipeline(pipeline);
+  await setPipelineFor(videoId, pipeline);
   return { savedTo, title: pipeline.title };
 }
 
-async function stepAnalyze(settings, signal) {
-  const pipeline = await getPipeline();
-  if (!pipeline) throw new Error("먼저 ① 추출을 실행하세요.");
+async function stepAnalyze(settings, { videoId }, signal, job) {
+  const pipeline = await getPipelineFor(videoId);
+  if (!pipeline) throw new Error("이 영상은 아직 추출되지 않았습니다. 먼저 ① 추출을 실행하세요.");
 
   const totalChars = pipeline.segments.reduce((n, s) => n + s.text.length, 0);
-  await setJob({
+  await job({
     title: pipeline.title,
     detail: "Claude 분석 중...",
     progress: 8,
@@ -525,9 +559,9 @@ async function stepAnalyze(settings, signal) {
 
   pipeline.analysis = await analyzeTranscript(settings, pipeline, signal);
 
-  await setJob({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
+  await job({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
   const savedTo = await savePipelineNote(settings, pipeline);
-  await setPipeline(pipeline);
+  await setPipelineFor(videoId, pipeline);
   return { savedTo, title: pipeline.title };
 }
 
@@ -541,13 +575,16 @@ const STEP_LABEL = {
 };
 
 async function runStep(step, payload) {
-  if (activeRun) return; // 한 번에 한 단계만
+  const videoId = payload.videoId;
+  if (!videoId || activeRuns.has(videoId)) return; // 같은 영상은 한 번에 한 단계만
 
   const abort = new AbortController();
-  activeRun = { abort, serverJob: null };
+  const run = { abort, serverJob: null };
+  activeRuns.set(videoId, run);
 
   const settings = await getSettings();
-  await setJob({
+  const job = (patch) => setJobFor(videoId, patch);
+  await job({
     state: "running",
     step,
     stepLabel: STEP_LABEL[step] || step,
@@ -561,41 +598,42 @@ async function runStep(step, payload) {
 
   try {
     let result;
-    if (step === "extract") result = await stepExtract(settings, payload, abort.signal);
-    else if (step === "whisper") result = await stepWhisper(settings, payload, abort.signal);
-    else if (step === "polish") result = await stepPolish(settings, abort.signal);
-    else if (step === "analyze") result = await stepAnalyze(settings, abort.signal);
+    if (step === "extract") result = await stepExtract(settings, payload, abort.signal, job);
+    else if (step === "whisper")
+      result = await stepWhisper(settings, payload, abort.signal, job, run);
+    else if (step === "polish") result = await stepPolish(settings, payload, abort.signal, job);
+    else if (step === "analyze") result = await stepAnalyze(settings, payload, abort.signal, job);
     else throw new Error(`알 수 없는 단계: ${step}`);
 
-    await setJob({ state: "done", detail: "완료", result, progress: 100, etaSeconds: 0 });
+    await job({ state: "done", detail: "완료", result, progress: 100, etaSeconds: 0 });
     notifyUser(`${STEP_LABEL[step]} 완료`, `저장됨: ${result.savedTo}`);
     await appendProcessLog(settings, STEP_LABEL[step], result);
   } catch (e) {
     if (e.name === "AbortError" || abort.signal.aborted) {
-      await setJob({ state: "cancelled", detail: "중지됨" });
+      await job({ state: "cancelled", detail: "중지됨" });
       notifyUser("YouTube → Obsidian", "작업을 중지했습니다.");
     } else {
-      await setJob({ state: "error", error: e.message });
+      await job({ state: "error", error: e.message });
       notifyUser(`${STEP_LABEL[step]} 오류`, e.message);
     }
   } finally {
-    activeRun = null;
+    activeRuns.delete(videoId);
   }
 }
 
-async function cancelPipeline() {
-  if (!activeRun) {
+async function cancelRun(videoId) {
+  const run = activeRuns.get(videoId);
+  if (!run) {
     // 확장 새로고침/브라우저 재시작으로 실행 주체가 사라진 '유령 작업' 정리
-    const { lastJob } = await chrome.storage.local.get("lastJob");
-    if (lastJob?.state === "running") {
-      await setJob({ state: "cancelled", detail: "중지됨" });
+    const { jobs } = await chrome.storage.local.get({ jobs: {} });
+    if (jobs[videoId]?.state === "running") {
+      await setJobFor(videoId, { state: "cancelled", detail: "중지됨" });
     }
     return;
   }
-  const { abort, serverJob } = activeRun;
-  abort.abort();
-  if (serverJob) {
-    fetch(`${serverJob.base}/jobs/${serverJob.jobId}/cancel`, { method: "POST" }).catch(
+  run.abort.abort();
+  if (run.serverJob) {
+    fetch(`${run.serverJob.base}/jobs/${run.serverJob.jobId}/cancel`, { method: "POST" }).catch(
       () => {}
     );
   }
@@ -608,7 +646,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
   if (message?.type === "cancelPipeline") {
-    cancelPipeline();
+    cancelRun(message.videoId);
     sendResponse({ ok: true });
     return false;
   }
@@ -621,15 +659,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
-// 서비스 워커가 새로 시작됐는데 lastJob이 실행 중이면, 이전 실행 주체가
-// 사라진 것(확장 새로고침/브라우저 재시작)이므로 상태를 정리한다.
+// 서비스 워커가 새로 시작됐는데 실행 중으로 남은 작업이 있으면, 이전 실행
+// 주체가 사라진 것(확장 새로고침/브라우저 재시작)이므로 상태를 정리한다.
 (async () => {
-  const { lastJob } = await chrome.storage.local.get("lastJob");
-  const staleMs = Date.now() - (lastJob?.updatedAt || 0);
-  if (lastJob?.state === "running" && !activeRun && staleMs > 5000) {
-    await setJob({
-      state: "error",
-      error: "확장이 재시작되어 이전 작업이 중단되었습니다. 다시 실행해주세요.",
-    });
+  const { jobs } = await chrome.storage.local.get({ jobs: {} });
+  for (const [videoId, j] of Object.entries(jobs)) {
+    const staleMs = Date.now() - (j.updatedAt || 0);
+    if (j.state === "running" && !activeRuns.has(videoId) && staleMs > 5000) {
+      await setJobFor(videoId, {
+        state: "error",
+        error: "확장이 재시작되어 이전 작업이 중단되었습니다. 다시 실행해주세요.",
+      });
+    }
   }
 })();
