@@ -126,7 +126,38 @@ async function fetchViaGetTranscript(html) {
   return segments.length > 0 ? segments : null;
 }
 
-/** 2차 경로(폴백): 자막 트랙 timedtext URL을 json3 포맷으로 요청. */
+/** timedtext XML 응답(srv1: <text start dur> / srv3: <p t d>)을 파싱한다. */
+function parseTimedtextXml(xml) {
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+  const segments = [];
+
+  const srv1Nodes = doc.querySelectorAll("transcript > text");
+  if (srv1Nodes.length > 0) {
+    for (const n of srv1Nodes) {
+      const text = (n.textContent || "").replace(/\n/g, " ").trim();
+      if (!text) continue;
+      segments.push({
+        start: parseFloat(n.getAttribute("start") || "0"),
+        duration: parseFloat(n.getAttribute("dur") || "0"),
+        text,
+      });
+    }
+  } else {
+    for (const p of doc.querySelectorAll("p")) {
+      const text = (p.textContent || "").replace(/\n/g, " ").trim();
+      if (!text) continue;
+      segments.push({
+        start: parseInt(p.getAttribute("t") || "0", 10) / 1000,
+        duration: parseInt(p.getAttribute("d") || "0", 10) / 1000,
+        text,
+      });
+    }
+  }
+  if (segments.length === 0) throw new Error("XML 자막 파싱에 실패했습니다.");
+  return segments;
+}
+
+/** 자막 트랙 timedtext URL에서 세그먼트를 받는다 (json3 우선, XML 폴백). */
 async function fetchViaTimedtext(tracks, languages) {
   const pick = (pred) => tracks.find(pred);
   let track = null;
@@ -142,30 +173,39 @@ async function fetchViaTimedtext(tracks, languages) {
   }
   track = track || tracks[0];
 
-  const url = track.baseUrl + (track.baseUrl.includes("fmt=") ? "" : "&fmt=json3");
-  const resp = await fetch(url, { credentials: "same-origin" });
+  // 기존 fmt 파라미터가 있어도 json3로 강제 교체한다.
+  const url = new URL(track.baseUrl);
+  url.searchParams.set("fmt", "json3");
+
+  const resp = await fetch(url.toString(), { credentials: "same-origin" });
   if (!resp.ok) throw new Error(`자막 다운로드 실패 (HTTP ${resp.status})`);
 
   const body = await resp.text();
   if (!body.trim()) {
     throw new Error("YouTube가 빈 자막 응답을 반환했습니다 (토큰 요구 정책).");
   }
-  const data = JSON.parse(body);
 
-  const segments = [];
-  for (const ev of data.events || []) {
-    if (!ev.segs) continue;
-    const text = ev.segs
-      .map((s) => s.utf8 || "")
-      .join("")
-      .replace(/\n/g, " ")
-      .trim();
-    if (!text) continue;
-    segments.push({
-      start: (ev.tStartMs || 0) / 1000,
-      duration: (ev.dDurationMs || 0) / 1000,
-      text,
-    });
+  // json3를 요청해도 XML로 응답하는 경우가 있어 둘 다 처리한다.
+  let segments;
+  if (body.trimStart().startsWith("<")) {
+    segments = parseTimedtextXml(body);
+  } else {
+    const data = JSON.parse(body);
+    segments = [];
+    for (const ev of data.events || []) {
+      if (!ev.segs) continue;
+      const text = ev.segs
+        .map((s) => s.utf8 || "")
+        .join("")
+        .replace(/\n/g, " ")
+        .trim();
+      if (!text) continue;
+      segments.push({
+        start: (ev.tStartMs || 0) / 1000,
+        duration: (ev.dDurationMs || 0) / 1000,
+        text,
+      });
+    }
   }
   if (segments.length === 0) throw new Error("자막이 비어 있습니다.");
   return { segments, language: track.languageCode, auto: track.kind === "asr" };
@@ -226,7 +266,21 @@ async function extractTranscript(videoId, languages) {
     errors.push(e.message);
   }
 
-  // 2차: 웹 플레이어의 timedtext URL
+  // 2차: ANDROID 클라이언트 player API의 timedtext URL (토큰 요구 없음)
+  try {
+    const { segments, language, auto } = await fetchViaAndroidPlayer(videoId, languages);
+    return {
+      videoId,
+      title,
+      segments,
+      language,
+      source: auto ? "youtube-captions-auto" : "youtube-captions",
+    };
+  } catch (e) {
+    errors.push(e.message);
+  }
+
+  // 3차: 웹 플레이어의 timedtext URL
   if (tracks.length > 0) {
     try {
       const { segments, language, auto } = await fetchViaTimedtext(tracks, languages);
@@ -240,20 +294,6 @@ async function extractTranscript(videoId, languages) {
     } catch (e) {
       errors.push(e.message);
     }
-  }
-
-  // 3차: ANDROID 클라이언트 player API의 timedtext URL
-  try {
-    const { segments, language, auto } = await fetchViaAndroidPlayer(videoId, languages);
-    return {
-      videoId,
-      title,
-      segments,
-      language,
-      source: auto ? "youtube-captions-auto" : "youtube-captions",
-    };
-  } catch (e) {
-    errors.push(e.message);
   }
 
   throw new Error(
