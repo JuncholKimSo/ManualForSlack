@@ -1,9 +1,8 @@
-// 팝업: 활성 탭의 YouTube 영상을 확인하고 파이프라인을 실행한다.
-// - 기본 경로: 브라우저에서 자막 추출 → 백그라운드에서 Claude 분석/저장
-// - Whisper 경로: 로컬 서버(yt2obsidian-server)에 작업을 맡기고 진행 상태를 폴링
+// 팝업: 시작 버튼 역할만 한다. 실제 작업은 백그라운드 서비스 워커가 수행하며,
+// 진행 상태는 chrome.storage의 lastJob을 구독해 표시한다.
+// → 팝업/창을 닫아도 작업은 계속되고, 완료 시 시스템 알림이 뜬다.
 
 const $ = (id) => document.getElementById(id);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function setStatus(text, cls = "") {
   const el = $("status");
@@ -33,83 +32,30 @@ async function getActiveYouTubeTab() {
   return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? { tab, videoId } : null;
 }
 
-// 백그라운드가 보내는 진행 상태 표시
-chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type === "status") setStatus(message.status);
-});
-
-/** 콘텐츠 스크립트에 메시지를 보낸다. 스크립트가 없으면(확장 설치/업데이트
- *  전에 열린 탭) 직접 주입한 뒤 한 번 재시도한다. */
-async function sendToContentScript(tabId, message) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, message);
-  } catch (_) {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-    return chrome.tabs.sendMessage(tabId, message);
-  }
-}
-
-/** 기본 경로: 브라우저 자막 추출 → 백그라운드 처리 */
-async function runViaBrowser(found, doAnalysis) {
-  const { languages } = await chrome.storage.local.get({ languages: "ko,en" });
-
-  setStatus("자막 추출 중...");
-  const extracted = await sendToContentScript(found.tab.id, {
-    type: "extractTranscript",
-    videoId: found.videoId,
-    languages: languages.split(",").map((s) => s.trim()).filter(Boolean),
-  });
-  if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
-
-  const payload = { ...extracted.result, doAnalysis };
-  setStatus(`자막 ${payload.segments.length}개 구간 추출 완료. 처리 중...`);
-
-  const processed = await chrome.runtime.sendMessage({ type: "processVideo", payload });
-  if (!processed?.ok) throw new Error(processed?.error || "처리 실패");
-  return processed.result;
-}
-
-/** Whisper 경로: 로컬 서버에 작업을 맡기고 완료까지 폴링 */
-async function runViaServer(found, doAnalysis) {
-  const { serverUrl } = await chrome.storage.local.get({
-    serverUrl: "http://127.0.0.1:8765",
-  });
-  const base = serverUrl.replace(/\/+$/, "");
-
-  setStatus("로컬 서버에 작업 요청 중...");
-  let resp;
-  try {
-    resp = await fetch(`${base}/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        url: `https://www.youtube.com/watch?v=${found.videoId}`,
-        use_whisper: true,
-        do_analysis: doAnalysis,
-      }),
-    });
-  } catch (_) {
-    throw new Error(
-      "로컬 서버에 연결할 수 없습니다. 터미널에서 yt2obsidian-server 가 실행 중인지 확인하세요."
+function renderJob(job) {
+  if (!job) return;
+  const suffix = job.title ? `\n🎬 ${job.title}` : "";
+  if (job.state === "running") {
+    $("run").disabled = true;
+    setStatus(
+      `⏳ ${job.detail}${suffix}\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)`
     );
-  }
-  if (!resp.ok) throw new Error(`서버 오류 (HTTP ${resp.status})`);
-  const { job_id } = await resp.json();
-
-  // 팝업을 닫아도 서버는 계속 처리하고 Vault에 저장한다.
-  while (true) {
-    await sleep(2000);
-    const job = await (await fetch(`${base}/jobs/${job_id}`)).json();
-    if (job.status === "done") {
-      return { savedTo: job.result.saved_to, analyzed: job.result.analyzed };
-    }
-    if (job.status === "error") throw new Error(job.error);
-    setStatus(`${job.detail || "처리 중..."}\n(팝업을 닫아도 서버에서 계속 처리됩니다)`);
+  } else if (job.state === "done") {
+    $("run").disabled = false;
+    setStatus(
+      `✅ 저장 완료: ${job.result.savedTo}${job.result.analyzed ? "\n(Claude 분석 포함)" : ""}${suffix}`,
+      "success"
+    );
+  } else if (job.state === "error") {
+    $("run").disabled = false;
+    setStatus(`❌ ${job.error}`, "error");
   }
 }
+
+// 백그라운드가 갱신하는 진행 상태를 실시간 반영
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.lastJob) renderJob(changes.lastJob.newValue);
+});
 
 async function run() {
   const found = await getActiveYouTubeTab();
@@ -118,32 +64,30 @@ async function run() {
     return;
   }
 
-  const button = $("run");
-  button.disabled = true;
   const doAnalysis = $("do-analysis").checked;
   const useWhisper = $("use-whisper").checked;
   await chrome.storage.local.set({ useWhisper });
 
-  try {
-    const result = useWhisper
-      ? await runViaServer(found, doAnalysis)
-      : await runViaBrowser(found, doAnalysis);
-    setStatus(
-      `✅ 저장 완료: ${result.savedTo}${result.analyzed ? "\n(Claude 분석 포함)" : ""}`,
-      "success"
-    );
-  } catch (e) {
-    setStatus(`❌ ${e.message}`, "error");
-  } finally {
-    button.disabled = false;
-  }
+  // 시작 신호만 보낸다 — 이후는 백그라운드가 알아서 진행.
+  chrome.runtime
+    .sendMessage({
+      type: "startPipeline",
+      payload: { tabId: found.tab.id, videoId: found.videoId, doAnalysis, useWhisper },
+    })
+    .catch(() => {});
+
+  $("run").disabled = true;
+  setStatus("⏳ 시작 중...\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)");
 }
 
 async function init() {
   $("run").addEventListener("click", run);
   $("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-  const { useWhisper } = await chrome.storage.local.get({ useWhisper: false });
+  const { useWhisper, lastJob } = await chrome.storage.local.get({
+    useWhisper: false,
+    lastJob: null,
+  });
   $("use-whisper").checked = useWhisper;
 
   const found = await getActiveYouTubeTab();
@@ -152,6 +96,11 @@ async function init() {
   } else {
     $("video-title").textContent = "YouTube 영상 페이지가 아닙니다.";
     $("run").disabled = true;
+  }
+
+  // 진행 중이거나 최근 완료된 작업 상태를 복원해서 보여준다.
+  if (lastJob && (lastJob.state === "running" || Date.now() - lastJob.updatedAt < 120_000)) {
+    renderJob(lastJob);
   }
 }
 

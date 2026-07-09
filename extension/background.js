@@ -1,4 +1,7 @@
-// 백그라운드 서비스 워커: Claude API 호출 + Obsidian 저장을 담당한다.
+// 백그라운드 서비스 워커: 전체 파이프라인을 지휘한다.
+// 팝업은 시작 신호만 보내고 닫혀도 되며, 진행 상태는 chrome.storage에 기록되어
+// 팝업을 다시 열면 이어서 보인다. 완료/오류 시 시스템 알림을 띄운다.
+//
 // MV3는 원격 코드 로드를 금지하고 이 확장은 번들러 없이 배포되므로,
 // Anthropic SDK 대신 공식 REST API를 직접 호출한다 (CORS는
 // anthropic-dangerous-direct-browser-access 헤더로 공식 지원됨).
@@ -31,6 +34,7 @@ const SYSTEM_PROMPT = `당신은 YouTube 영상 트랜스크립트를 분석해 
 제목/헤더 외에 불필요한 서두나 맺음말은 쓰지 마세요.`;
 
 const MAX_TRANSCRIPT_CHARS = 350_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function getSettings() {
   const defaults = {
@@ -41,10 +45,40 @@ async function getSettings() {
     obsidianFolder: "YouTube",
     languages: "ko,en",
     doAnalysis: true,
+    serverUrl: "http://127.0.0.1:8765",
   };
   const stored = await chrome.storage.local.get(defaults);
   return { ...defaults, ...stored };
 }
+
+/** 진행 상태를 storage에 기록한다 — 팝업이 이걸 구독해서 표시한다. */
+async function setJob(patch) {
+  const { lastJob } = await chrome.storage.local.get("lastJob");
+  const job = { ...(lastJob || {}), ...patch, updatedAt: Date.now() };
+  await chrome.storage.local.set({ lastJob: job });
+  return job;
+}
+
+function notifyUser(title, message) {
+  chrome.notifications
+    .create({ type: "basic", iconUrl: "icon128.png", title, message })
+    .catch(() => {});
+}
+
+// ---------- 자막 추출 (콘텐츠 스크립트 경유) ----------
+
+async function extractViaContentScript(tabId, videoId, languages) {
+  const message = { type: "extractTranscript", videoId, languages };
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (_) {
+    // 확장 설치/업데이트 전에 열린 탭에는 스크립트가 없으므로 주입 후 재시도
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
+// ---------- Claude 분석 ----------
 
 function renderTranscriptForPrompt(segments) {
   const text = segments
@@ -53,7 +87,7 @@ function renderTranscriptForPrompt(segments) {
     .join("\n");
   if (text.length > MAX_TRANSCRIPT_CHARS) {
     throw new Error(
-      `트랜스크립트가 너무 깁니다 (${text.length.toLocaleString()}자). 긴 영상은 CLI로 처리하세요.`
+      `트랜스크립트가 너무 깁니다 (${text.length.toLocaleString()}자). 긴 영상은 로컬 서버(CLI)로 처리하세요.`
     );
   }
   return text;
@@ -106,7 +140,8 @@ async function analyzeWithClaude(settings, { videoId, title, segments }) {
     .join("");
 }
 
-/** Obsidian Local REST API 플러그인으로 노트를 저장한다. */
+// ---------- Obsidian 저장 ----------
+
 async function saveViaRestApi(settings, filename, content) {
   const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
   const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
@@ -127,7 +162,6 @@ async function saveViaRestApi(settings, filename, content) {
   return notePath;
 }
 
-/** REST API를 쓸 수 없을 때: .md 파일로 다운로드 (사용자가 Vault로 옮김). */
 async function saveViaDownload(filename, content) {
   const url = "data:text/markdown;charset=utf-8," + encodeURIComponent(content);
   await chrome.downloads.download({
@@ -138,39 +172,105 @@ async function saveViaDownload(filename, content) {
   return `(다운로드) ${filename}.md`;
 }
 
-async function processVideo(payload, notify) {
-  const settings = await getSettings();
-  const { videoId, title, segments, language, source } = payload;
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+// ---------- 파이프라인: 브라우저 자막 경로 ----------
+
+async function runBrowserPipeline(settings, { tabId, videoId, doAnalysis }) {
+  await setJob({ detail: "자막 추출 중..." });
+  const languages = settings.languages.split(",").map((s) => s.trim()).filter(Boolean);
+  const extracted = await extractViaContentScript(tabId, videoId, languages);
+  if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
+
+  const { title, segments, language, source } = extracted.result;
+  await setJob({ title, detail: `자막 ${segments.length}개 구간 추출 완료.` });
 
   let analysis = null;
-  if (settings.doAnalysis && payload.doAnalysis !== false) {
-    notify("Claude 분석 중... (영상 길이에 따라 수십 초 걸릴 수 있습니다)");
-    analysis = await analyzeWithClaude(settings, payload);
+  if (doAnalysis) {
+    await setJob({ detail: "Claude 분석 중... (수십 초 걸릴 수 있습니다)" });
+    analysis = await analyzeWithClaude(settings, { videoId, title, segments });
   }
 
-  notify("노트 생성 및 저장 중...");
+  await setJob({ detail: "노트 생성 및 저장 중..." });
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
   const note = buildNote({ videoId, title, url, segments, language, source, analysis });
   const filename = sanitizeFilename(title);
 
-  let savedTo;
-  if (settings.obsidianApiKey) {
-    savedTo = await saveViaRestApi(settings, filename, note);
-  } else {
-    savedTo = await saveViaDownload(filename, note);
+  const savedTo = settings.obsidianApiKey
+    ? await saveViaRestApi(settings, filename, note)
+    : await saveViaDownload(filename, note);
+  return { savedTo, analyzed: Boolean(analysis), title };
+}
+
+// ---------- 파이프라인: Whisper(로컬 서버) 경로 ----------
+
+async function runServerPipeline(settings, { videoId, doAnalysis }) {
+  const base = settings.serverUrl.replace(/\/+$/, "");
+
+  await setJob({ detail: "로컬 서버에 작업 요청 중..." });
+  let resp;
+  try {
+    resp = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        use_whisper: true,
+        do_analysis: doAnalysis,
+      }),
+    });
+  } catch (_) {
+    throw new Error(
+      "로컬 서버에 연결할 수 없습니다. 터미널에서 yt2obsidian-server 가 실행 중인지 확인하세요."
+    );
   }
-  return { savedTo, analyzed: Boolean(analysis) };
+  if (!resp.ok) throw new Error(`서버 오류 (HTTP ${resp.status})`);
+  const { job_id: jobId } = await resp.json();
+
+  while (true) {
+    await sleep(2000);
+    const job = await (await fetch(`${base}/jobs/${jobId}`)).json();
+    if (job.status === "done") {
+      return {
+        savedTo: job.result.saved_to,
+        analyzed: job.result.analyzed,
+        title: job.result.title,
+      };
+    }
+    if (job.status === "error") throw new Error(job.error);
+    await setJob({ detail: job.detail || "처리 중..." });
+  }
+}
+
+// ---------- 진입점 ----------
+
+async function startPipeline(payload) {
+  const settings = await getSettings();
+  await chrome.storage.local.set({
+    lastJob: {
+      state: "running",
+      videoId: payload.videoId,
+      title: null,
+      detail: "시작 중...",
+      result: null,
+      error: null,
+      updatedAt: Date.now(),
+    },
+  });
+
+  try {
+    const result = payload.useWhisper
+      ? await runServerPipeline(settings, payload)
+      : await runBrowserPipeline(settings, payload);
+    await setJob({ state: "done", detail: "완료", result });
+    notifyUser("YouTube → Obsidian 완료", `저장됨: ${result.savedTo}`);
+  } catch (e) {
+    await setJob({ state: "error", error: e.message });
+    notifyUser("YouTube → Obsidian 오류", e.message);
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "processVideo") return false;
-
-  const notify = (status) => {
-    chrome.runtime.sendMessage({ type: "status", status }).catch(() => {});
-  };
-
-  processVideo(message.payload, notify)
-    .then((result) => sendResponse({ ok: true, result }))
-    .catch((e) => sendResponse({ ok: false, error: e.message }));
-  return true; // 비동기 응답
+  if (message?.type !== "startPipeline") return false;
+  startPipeline(message.payload); // 팝업이 닫혀도 계속 진행
+  sendResponse({ ok: true });
+  return false;
 });
