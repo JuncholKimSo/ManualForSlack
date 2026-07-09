@@ -1,6 +1,8 @@
 // YouTube 페이지에서 실행되는 콘텐츠 스크립트.
-// 자막 트랙 목록을 찾아 타임스탬프가 포함된 트랜스크립트를 추출한다.
-// (같은 도메인이므로 watch 페이지와 자막(timedtext) API를 직접 fetch할 수 있다)
+// 자막 트랙을 찾아 타임스탬프가 포함된 트랜스크립트를 추출한다.
+//
+// 1차: youtubei/v1/get_transcript (YouTube 웹의 "스크립트 표시" 패널이 쓰는 내부 API)
+// 2차: 자막 트랙 timedtext URL (구형 경로 — YouTube가 빈 응답을 줄 수 있어 폴백으로만 사용)
 
 /** 중괄호 짝을 맞춰 HTML에 인라인된 JSON 객체를 잘라낸다. */
 function extractBalancedJson(text, start) {
@@ -25,40 +27,118 @@ function extractBalancedJson(text, start) {
   throw new Error("페이지에서 플레이어 데이터(JSON)를 파싱하지 못했습니다.");
 }
 
-/** watch 페이지 HTML에서 ytInitialPlayerResponse를 가져온다.
- *  SPA 내비게이션으로 페이지의 전역 변수가 오래됐을 수 있어 항상 새로 fetch한다. */
-async function fetchPlayerResponse(videoId) {
+/** SPA 내비게이션으로 전역 변수가 오래됐을 수 있어 watch 페이지를 항상 새로 fetch한다. */
+async function fetchWatchHtml(videoId) {
   const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
     credentials: "same-origin",
   });
-  const html = await resp.text();
+  return resp.text();
+}
+
+function parsePlayerResponse(html) {
   const marker = "ytInitialPlayerResponse = ";
   const idx = html.indexOf(marker);
-  if (idx === -1) {
-    throw new Error("영상 페이지에서 플레이어 데이터를 찾지 못했습니다.");
+  if (idx === -1) return null;
+  try {
+    return JSON.parse(extractBalancedJson(html, idx + marker.length));
+  } catch (_) {
+    return null;
   }
-  return JSON.parse(extractBalancedJson(html, idx + marker.length));
 }
 
-/** 언어 우선순위에 따라 자막 트랙을 고른다. 수동 자막 > 자동 생성(asr) 순. */
-function pickCaptionTrack(tracks, languages) {
-  for (const lang of languages) {
-    const manual = tracks.find((t) => t.languageCode === lang && t.kind !== "asr");
-    if (manual) return manual;
+/** 객체 트리에서 특정 키를 가진 첫 번째 값을 깊이 우선으로 찾는다. */
+function findFirstKey(node, key) {
+  if (node === null || typeof node !== "object") return undefined;
+  if (!Array.isArray(node) && Object.prototype.hasOwnProperty.call(node, key)) {
+    return node[key];
   }
-  for (const lang of languages) {
-    const any = tracks.find((t) => t.languageCode === lang);
-    if (any) return any;
+  for (const child of Array.isArray(node) ? node : Object.values(node)) {
+    const found = findFirstKey(child, key);
+    if (found !== undefined) return found;
   }
-  return tracks[0];
+  return undefined;
 }
 
-/** 자막 트랙을 json3 포맷으로 받아 {start, duration, text} 배열로 변환한다. */
-async function fetchSegments(track) {
+/** 1차 경로: YouTube 내부 get_transcript API.
+ *  watch 페이지의 ytInitialData에 들어 있는 params를 그대로 사용한다. */
+async function fetchViaGetTranscript(html) {
+  const paramsMatch = html.match(
+    /"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/
+  );
+  if (!paramsMatch) return null; // 트랜스크립트 패널이 없는 영상
+
+  const apiKey = (html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/) || [])[1];
+  const clientVersion =
+    (html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION"\s*:\s*"([^"]+)"/) || [])[1] ||
+    "2.20250601.00.00";
+
+  const url =
+    "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false" +
+    (apiKey ? `&key=${apiKey}` : "");
+
+  const resp = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      context: { client: { clientName: "WEB", clientVersion } },
+      params: paramsMatch[1],
+    }),
+  });
+  if (!resp.ok) throw new Error(`get_transcript 실패 (HTTP ${resp.status})`);
+
+  const data = await resp.json();
+  const segList = findFirstKey(data, "transcriptSegmentListRenderer");
+  if (!segList?.initialSegments) {
+    throw new Error("get_transcript 응답에서 자막 구간을 찾지 못했습니다.");
+  }
+
+  const segments = [];
+  for (const item of segList.initialSegments) {
+    const seg = item.transcriptSegmentRenderer;
+    if (!seg) continue; // 섹션 헤더 등은 건너뜀
+    const text = (seg.snippet?.runs || [])
+      .map((r) => r.text || "")
+      .join("")
+      .replace(/\n/g, " ")
+      .trim();
+    if (!text) continue;
+    const startMs = Number(seg.startMs || 0);
+    const endMs = Number(seg.endMs || startMs);
+    segments.push({
+      start: startMs / 1000,
+      duration: Math.max(0, (endMs - startMs) / 1000),
+      text,
+    });
+  }
+  return segments.length > 0 ? segments : null;
+}
+
+/** 2차 경로(폴백): 자막 트랙 timedtext URL을 json3 포맷으로 요청. */
+async function fetchViaTimedtext(tracks, languages) {
+  const pick = (pred) => tracks.find(pred);
+  let track = null;
+  for (const lang of languages) {
+    track = pick((t) => t.languageCode === lang && t.kind !== "asr");
+    if (track) break;
+  }
+  if (!track) {
+    for (const lang of languages) {
+      track = pick((t) => t.languageCode === lang);
+      if (track) break;
+    }
+  }
+  track = track || tracks[0];
+
   const url = track.baseUrl + (track.baseUrl.includes("fmt=") ? "" : "&fmt=json3");
   const resp = await fetch(url, { credentials: "same-origin" });
   if (!resp.ok) throw new Error(`자막 다운로드 실패 (HTTP ${resp.status})`);
-  const data = await resp.json();
+
+  const body = await resp.text();
+  if (!body.trim()) {
+    throw new Error("YouTube가 빈 자막 응답을 반환했습니다 (토큰 요구 정책).");
+  }
+  const data = JSON.parse(body);
 
   const segments = [];
   for (const ev of data.events || []) {
@@ -75,32 +155,57 @@ async function fetchSegments(track) {
       text,
     });
   }
-  return segments;
+  if (segments.length === 0) throw new Error("자막이 비어 있습니다.");
+  return { segments, language: track.languageCode, auto: track.kind === "asr" };
 }
 
 async function extractTranscript(videoId, languages) {
-  const player = await fetchPlayerResponse(videoId);
+  const html = await fetchWatchHtml(videoId);
+  const player = parsePlayerResponse(html);
   const title = player?.videoDetails?.title || videoId;
   const tracks =
     player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
 
-  if (tracks.length === 0) {
-    throw new Error(
-      "이 영상에는 자막이 없습니다. 자막 없는 영상은 CLI의 Whisper 음성 인식을 사용하세요."
-    );
+  // 1차: get_transcript (현재 YouTube에서 가장 안정적인 경로)
+  let primaryError = null;
+  try {
+    const segments = await fetchViaGetTranscript(html);
+    if (segments) {
+      return {
+        videoId,
+        title,
+        segments,
+        language: tracks[0]?.languageCode || "unknown",
+        source: "youtube-transcript-panel",
+      };
+    }
+  } catch (e) {
+    primaryError = e;
   }
 
-  const track = pickCaptionTrack(tracks, languages);
-  const segments = await fetchSegments(track);
-  if (segments.length === 0) throw new Error("자막이 비어 있습니다.");
+  // 2차: timedtext 폴백
+  if (tracks.length > 0) {
+    try {
+      const { segments, language, auto } = await fetchViaTimedtext(tracks, languages);
+      return {
+        videoId,
+        title,
+        segments,
+        language,
+        source: auto ? "youtube-captions-auto" : "youtube-captions",
+      };
+    } catch (e) {
+      throw new Error(
+        `자막 추출에 실패했습니다 (${primaryError?.message || "패널 없음"} / ${e.message}). ` +
+          "팝업의 '음성 인식(Whisper) 사용'을 켜고 로컬 서버로 처리해보세요."
+      );
+    }
+  }
 
-  return {
-    videoId,
-    title,
-    segments,
-    language: track.languageCode,
-    source: track.kind === "asr" ? "youtube-captions-auto" : "youtube-captions",
-  };
+  throw new Error(
+    "이 영상에는 자막이 없습니다. 팝업의 '음성 인식(Whisper) 사용'을 켜고 " +
+      "로컬 서버(yt2obsidian-server)로 처리하세요."
+  );
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

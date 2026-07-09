@@ -72,6 +72,15 @@
   <label for="languages">언어 우선순위 (쉼표 구분)</label>
   <input type="text" id="languages" placeholder="ko,en" />
 
+  <h2>음성 인식 (Whisper) — 로컬 서버</h2>
+  <label for="serverUrl">로컬 서버 주소</label>
+  <input type="text" id="serverUrl" placeholder="http://127.0.0.1:8765" />
+  <div class="hint">
+    자막이 없거나 음성을 직접 받아적고 싶을 때 사용합니다. 터미널에서
+    <code>yt2obsidian-server</code>를 실행해두고, 팝업에서 "음성 인식(Whisper) 사용"을 켜세요.
+    이 경로는 서버가 Vault에 직접 저장하므로 Obsidian REST API 설정이 필요 없습니다.
+  </div>
+
   <button id="save">저장</button><span id="saved"></span>
 
   <script src="options.js"></script>

@@ -8,6 +8,7 @@ const DEFAULTS = {
   obsidianFolder: "YouTube",
   languages: "ko,en",
   doAnalysis: true,
+  serverUrl: "http://127.0.0.1:8765",
 };
 
 const FIELDS = Object.keys(DEFAULTS);
@@ -29,6 +30,7 @@ async function save() {
   }
   if (!values.model) values.model = DEFAULTS.model;
   if (!values.obsidianBaseUrl) values.obsidianBaseUrl = DEFAULTS.obsidianBaseUrl;
+  if (!values.serverUrl) values.serverUrl = DEFAULTS.serverUrl;
 
   await chrome.storage.local.set(values);
   const saved = document.getElementById("saved");

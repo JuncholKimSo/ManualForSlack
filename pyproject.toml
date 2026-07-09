@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 yt2obsidian = "youtube2obsidian.cli:main"
+yt2obsidian-server = "youtube2obsidian.server:main"
 
 [tool.setuptools.packages.find]
 include = ["youtube2obsidian*"]

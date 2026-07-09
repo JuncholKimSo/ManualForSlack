@@ -41,9 +41,25 @@ YouTube 영상 페이지 (버튼 클릭)
 | Vault 내 저장 폴더 | 기본 `YouTube` |
 | 자막 언어 우선순위 | 기본 `ko,en` |
 
+### 음성 인식(Whisper) 모드 — 로컬 서버
+
+자막이 없는 영상이나 음성을 직접 받아적고 싶을 때 사용합니다. 브라우저에서는 음성 인식이
+불가능하므로, 확장이 로컬에서 실행 중인 컴패니언 서버에 작업을 맡깁니다:
+
+```bash
+pip install -e ".[whisper]"        # yt-dlp + faster-whisper (ffmpeg 필요)
+export ANTHROPIC_API_KEY=sk-ant-...
+export OBSIDIAN_VAULT_PATH=~/Documents/MyVault
+yt2obsidian-server                 # http://127.0.0.1:8765 에서 대기
+```
+
+서버를 켜둔 상태에서 확장 팝업의 **"음성 인식(Whisper) 사용"** 을 체크하고 실행하면:
+오디오 다운로드 → Whisper 음성 인식 → Claude 분석 → **서버가 Vault에 직접 저장**
+(이 경로는 Obsidian REST API 설정이 필요 없습니다). 팝업을 닫아도 서버가 계속 처리합니다.
+
 ### 제약
 
-- **자막이 없는 영상은 처리할 수 없습니다** — 브라우저에서는 Whisper 음성 인식이 불가능하므로, 이 경우 아래 Python CLI를 사용하세요.
+- 브라우저 자막 모드는 자막(수동/자동)이 있는 영상 전용입니다. 자막이 없으면 위 Whisper 모드를 사용하세요.
 - API 키는 `chrome.storage.local`(이 브라우저의 확장 저장소)에 보관됩니다. 개인용 도구 기준으로 설계되었습니다.
 
 ---
