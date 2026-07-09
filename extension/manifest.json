@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube → Obsidian (Claude 분석)",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "YouTube 영상의 자막을 타임스탬프와 함께 추출하고, Claude로 분석해 Obsidian에 저장합니다.",
   "permissions": ["storage", "downloads", "activeTab", "scripting"],
   "host_permissions": [
