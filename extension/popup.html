@@ -5,7 +5,7 @@
   <style>
     body {
       font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      width: 320px;
+      width: 340px;
       margin: 0;
       padding: 16px;
       background: #fafafa;
@@ -19,29 +19,41 @@
       max-height: 3em;
       overflow: hidden;
     }
-    label { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 12px; }
     button {
       width: 100%;
       padding: 10px;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 600;
       border: none;
       border-radius: 8px;
       background: #7c3aed;
       color: #fff;
       cursor: pointer;
+      margin-bottom: 8px;
     }
     button:disabled { background: #c4b5fd; cursor: default; }
+    button.secondary {
+      background: #ede9fe;
+      color: #5b21b6;
+    }
+    button.secondary:disabled { background: #f3f0fc; color: #c4b5fd; }
     #stop {
       display: none;
-      margin-top: 8px;
       background: #f3f4f6;
       color: #dc2626;
       border: 1px solid #e5e7eb;
     }
+    .step-row { display: flex; gap: 8px; }
+    .step-row button { flex: 1; }
+    #pipeline-state {
+      font-size: 11px;
+      color: #6b7280;
+      margin: 2px 0 10px;
+      line-height: 1.6;
+    }
     #progress-wrap {
       display: none;
-      margin-top: 12px;
+      margin-top: 4px;
       height: 8px;
       background: #e9e4f8;
       border-radius: 4px;
@@ -63,7 +75,7 @@
       text-align: right;
     }
     #status {
-      margin-top: 12px;
+      margin-top: 10px;
       font-size: 12px;
       line-height: 1.5;
       white-space: pre-wrap;
@@ -78,24 +90,23 @@
 <body>
   <h1>YouTube → Obsidian</h1>
   <div id="video-title">영상 확인 중...</div>
-  <label>
-    <input type="checkbox" id="do-analysis" checked />
-    Claude로 분석 포함
-  </label>
-  <label>
-    <input type="checkbox" id="do-polish" />
-    자막 교정 (자동 자막의 오탈자·문장 다듬기, 비용 추가)
-  </label>
-  <label>
-    <input type="checkbox" id="use-whisper" />
-    음성 인식(Whisper) 사용 — 로컬 서버 필요
-  </label>
-  <button id="run">트랜스크립트 추출 → Obsidian 저장</button>
+
+  <button id="run-extract">① 트랜스크립트 추출 (자막)</button>
+  <button id="run-whisper" class="secondary">① 음성 인식으로 추출 (Whisper·로컬 서버)</button>
+
+  <div id="pipeline-state"></div>
+
+  <div class="step-row">
+    <button id="run-polish" class="secondary" disabled>② 자막 교정</button>
+    <button id="run-analyze" class="secondary" disabled>③ Claude 분석</button>
+  </div>
+
   <button id="stop">■ 작업 중지</button>
+
   <div id="progress-wrap"><div id="progress-bar"></div></div>
   <div id="progress-label"></div>
   <div id="status"></div>
-  <div class="footer"><a id="open-options">⚙️ 설정 (API 키 / Vault)</a></div>
+  <div class="footer"><a id="open-options">⚙️ 설정 (API 키 / Vault / 모델)</a></div>
   <script src="popup.js"></script>
 </body>
 </html>

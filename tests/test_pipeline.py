@@ -63,6 +63,28 @@ class TestGroupSegments:
     def test_empty(self):
         assert group_segments([]) == []
 
+    def test_speaker_change_breaks_group(self):
+        segments = [
+            Segment(start=0.0, duration=5.0, text="안녕하세요 오늘 주제는"),
+            Segment(start=5.0, duration=5.0, text=">> 반갑습니다 저는 발표자입니다"),
+            Segment(start=10.0, duration=5.0, text="이어서 설명드리면"),
+        ]
+        g = group_segments(segments, window=60.0)
+        assert len(g) == 2
+        assert g[0].text == "안녕하세요 오늘 주제는"
+        assert g[1].text.startswith("반갑습니다")
+        assert ">>" not in g[1].text
+        assert g[1].start == 5.0
+
+    def test_mid_segment_speaker_marker(self):
+        segments = [
+            Segment(start=0.0, duration=6.0, text="질문 있나요 >> 네 질문 있습니다"),
+        ]
+        g = group_segments(segments, window=60.0)
+        assert len(g) == 2
+        assert g[0].text == "질문 있나요"
+        assert g[1].text == "네 질문 있습니다"
+
 
 class TestBuildNote:
     def make_transcript(self):

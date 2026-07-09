@@ -1,6 +1,9 @@
-// 백그라운드 서비스 워커: 전체 파이프라인을 지휘한다.
-// 팝업은 시작 신호만 보내고 닫혀도 되며, 진행 상태는 chrome.storage에 기록되어
-// 팝업을 다시 열면 이어서 보인다. 완료/오류 시 시스템 알림을 띄운다.
+// 백그라운드 서비스 워커: 단계 선택형 파이프라인을 지휘한다.
+//   ① 추출 (자막 또는 Whisper) → 노트 저장
+//   ② 자막 교정 (선택)        → 같은 노트 갱신
+//   ③ Claude 분석 (선택)      → 같은 노트 갱신
+// 각 단계는 팝업에서 따로 실행하고, 상태는 chrome.storage에 남아
+// 팝업을 닫아도 이어진다. 완료/오류 시 시스템 알림.
 //
 // MV3는 원격 코드 로드를 금지하고 이 확장은 번들러 없이 배포되므로,
 // Anthropic SDK 대신 공식 REST API를 직접 호출한다 (CORS는
@@ -10,7 +13,7 @@ import { buildNote, formatTimestamp, groupSegments, sanitizeFilename } from "./m
 
 const DEFAULT_MODEL = "claude-opus-4-8";
 
-const SYSTEM_PROMPT = `당신은 YouTube 영상 트랜스크립트를 분석해 Obsidian 노트용 Markdown을 작성하는 전문가입니다.
+const ANALYSIS_SYSTEM = `당신은 YouTube 영상 트랜스크립트를 분석해 Obsidian 노트용 Markdown을 작성하는 전문가입니다.
 
 입력으로 [MM:SS] 타임스탬프가 붙은 트랜스크립트를 받습니다.
 다음 구조로 한국어 분석을 작성하세요:
@@ -33,18 +36,25 @@ const SYSTEM_PROMPT = `당신은 YouTube 영상 트랜스크립트를 분석해 
 타임스탬프는 반드시 입력에 실제로 존재하는 시각만 사용하세요. 내용을 지어내지 마세요.
 제목/헤더 외에 불필요한 서두나 맺음말은 쓰지 마세요.`;
 
-const POLISH_SYSTEM = `당신은 음성 인식 자막 교정 전문가입니다.
-[타임스탬프]가 붙은 자막 문단들을 받아, 각 문단을 읽기 좋은 글로 교정하세요:
-- 문맥상 잘못 인식된 단어를 바로잡기
-- 문장부호(마침표, 쉼표, 물음표)와 띄어쓰기 추가
-- 어색하게 끊긴 문장을 자연스럽게 잇기
-규칙: 내용을 추가·삭제·요약하지 마세요. 각 줄 맨 앞의 [타임스탬프]를 그대로 유지하고,
-줄 수와 순서를 입력과 동일하게 유지하세요. 교정된 줄들만 출력하세요.`;
+function polishSystemPrompt(title) {
+  return `당신은 한국어 음성 인식 자막을 다듬는 전문 편집자입니다.
+지금 다룰 영상의 제목: "${title}"
+
+[타임스탬프]가 붙은 자막 문단들을 받습니다. 각 문단을 다음 기준으로 교정하세요:
+1. 음성 인식 오류 교정 — 문맥과 영상 주제에 비추어 잘못 받아적힌 단어를 올바르게 수정.
+   고유명사·전문용어는 영상 제목과 문맥을 근거로 가장 그럴듯한 표기로 통일.
+2. 문장부호(마침표·쉼표·물음표)와 띄어쓰기를 표준 맞춤법에 맞게 추가.
+3. 끊긴 문장은 자연스럽게 연결하고, 군더더기(어, 음, 같은 말 반복)는 정리.
+4. 말의 의미와 정보는 그대로 유지 — 새 내용을 추가하거나 요약하지 말 것.
+
+출력 형식: 각 문단을 "[타임스탬프] 교정된 텍스트" 한 줄로, 입력에 있던 타임스탬프를
+그대로 사용해 모두 출력하세요. 문단을 합치거나 나누지 마세요. 다른 말은 쓰지 마세요.`;
+}
 
 const MAX_TRANSCRIPT_CHARS = 350_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 진행 중인 작업의 중지 핸들 (파이프라인은 한 번에 하나만 실행)
+// 진행 중인 단계의 중지 핸들 (한 번에 한 단계만 실행)
 let activeRun = null; // { abort: AbortController, serverJob: {base, jobId} | null }
 
 function throwIfAborted(signal) {
@@ -63,7 +73,6 @@ async function getSettings() {
     obsidianApiKey: "",
     obsidianFolder: "YouTube",
     languages: "ko,en",
-    doAnalysis: true,
     serverUrl: "http://127.0.0.1:8765",
     whisperModel: "small",
   };
@@ -71,9 +80,8 @@ async function getSettings() {
   return { ...defaults, ...stored };
 }
 
-/** 진행 상태를 storage에 기록한다 — 팝업이 이걸 구독해서 표시한다.
- *  progress(단계 기준 %)가 바뀔 때만 stageStartedAt을 갱신해, 팝업이
- *  단계 경과 시간으로 진행 바를 부드럽게 채우고 남은 시간을 계산한다. */
+// ---------- 작업 상태 (팝업 표시용) ----------
+
 async function setJob(patch) {
   const { lastJob } = await chrome.storage.local.get("lastJob");
   const prev = lastJob || {};
@@ -91,6 +99,17 @@ function notifyUser(title, message) {
     .catch(() => {});
 }
 
+// ---------- 파이프라인 상태 (단계 간 공유) ----------
+
+async function getPipeline() {
+  const { pipeline } = await chrome.storage.local.get("pipeline");
+  return pipeline || null;
+}
+
+async function setPipeline(pipeline) {
+  await chrome.storage.local.set({ pipeline });
+}
+
 // ---------- 자막 추출 (콘텐츠 스크립트 경유) ----------
 
 async function extractViaContentScript(tabId, videoId, languages) {
@@ -104,9 +123,12 @@ async function extractViaContentScript(tabId, videoId, languages) {
   }
 }
 
-// ---------- Claude 자막 교정 ----------
+// ---------- Claude 호출 ----------
 
 async function callClaude(settings, system, userText, signal) {
+  if (!settings.anthropicApiKey) {
+    throw new Error("Anthropic API 키가 설정되지 않았습니다. 확장 옵션에서 설정하세요.");
+  }
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     signal,
@@ -144,13 +166,23 @@ async function callClaude(settings, system, userText, signal) {
     .join("");
 }
 
-/** 자동 자막(무문장부호·오인식)을 Claude로 문단 단위 교정한다.
- *  긴 영상은 출력 한도를 넘지 않도록 조각으로 나눠 순차 처리. */
-async function polishTranscript(settings, grouped, signal, onChunk) {
-  if (!settings.anthropicApiKey) {
-    throw new Error("Anthropic API 키가 설정되지 않았습니다. 확장 옵션에서 설정하세요.");
+function renderTranscriptForPrompt(segments) {
+  const text = segments
+    .filter((s) => s.text.trim())
+    .map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`)
+    .join("\n");
+  if (text.length > MAX_TRANSCRIPT_CHARS) {
+    throw new Error(
+      `트랜스크립트가 너무 깁니다 (${text.length.toLocaleString()}자). 긴 영상은 로컬 서버(CLI)로 처리하세요.`
+    );
   }
-  const lines = grouped.map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`);
+  return text;
+}
+
+/** 자막 교정: 문단 단위로 Claude가 오인식·문장부호·문장 연결을 다듬는다.
+ *  긴 영상은 조각으로 나눠 순차 처리. 결과는 타임스탬프로 매칭한다. */
+async function polishTranscript(settings, title, segments, signal, onChunk) {
+  const lines = segments.map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`);
 
   // 청크당 약 9,000자 — 응답(교정문)이 max_tokens를 넘지 않게 보수적으로.
   const chunks = [];
@@ -167,68 +199,60 @@ async function polishTranscript(settings, grouped, signal, onChunk) {
   }
   if (current.length > 0) chunks.push(current);
 
-  const polished = grouped.map((s) => ({ ...s }));
-  let offset = 0;
+  // 출력 줄을 타임스탬프 기준으로 수집 (줄 순서·개수가 어긋나도 안전)
+  const polishedByStamp = new Map();
+  const system = polishSystemPrompt(title);
   for (let c = 0; c < chunks.length; c++) {
     onChunk?.(c + 1, chunks.length);
     throwIfAborted(signal);
-    const output = await callClaude(settings, POLISH_SYSTEM, chunks[c].join("\n"), signal);
-    const outLines = output.split("\n").filter((l) => l.trim());
-    for (let i = 0; i < chunks[c].length; i++) {
-      const m = (outLines[i] || "").match(/^\[[\d:]+\]\s*(.+)$/);
-      // 교정 결과가 형식에 안 맞으면 해당 문단은 원문 유지 (내용 유실 방지)
-      if (m && m[1].trim()) {
-        polished[offset + i].text = m[1].trim();
-      }
+    const output = await callClaude(settings, system, chunks[c].join("\n"), signal);
+    for (const line of output.split("\n")) {
+      const m = line.match(/^\s*\[([\d:]+)\]\s*(.+)$/);
+      if (m && m[2].trim()) polishedByStamp.set(m[1], m[2].trim());
     }
-    offset += chunks[c].length;
   }
-  return polished;
+
+  // 매칭 실패한 문단은 원문 유지 (내용 유실 방지)
+  return segments.map((s) => {
+    const cleaned = polishedByStamp.get(formatTimestamp(s.start));
+    return cleaned ? { ...s, text: cleaned } : { ...s };
+  });
 }
 
-// ---------- Claude 분석 ----------
-
-function renderTranscriptForPrompt(segments) {
-  // 자동 자막은 2~3초짜리 조각 수백 개로 오기 때문에, 30초 문단으로 묶어
-  // 타임스탬프 줄 수를 줄이면 입력 토큰(비용)이 크게 감소한다.
-  const text = groupSegments(segments, 30)
-    .filter((s) => s.text.trim())
-    .map((s) => `[${formatTimestamp(s.start)}] ${s.text.trim()}`)
-    .join("\n");
-  if (text.length > MAX_TRANSCRIPT_CHARS) {
-    throw new Error(
-      `트랜스크립트가 너무 깁니다 (${text.length.toLocaleString()}자). 긴 영상은 로컬 서버(CLI)로 처리하세요.`
-    );
-  }
-  return text;
-}
-
-async function analyzeWithClaude(settings, { videoId, title, segments }, signal) {
-  if (!settings.anthropicApiKey) {
-    throw new Error("Anthropic API 키가 설정되지 않았습니다. 확장 옵션에서 설정하세요.");
-  }
+async function analyzeTranscript(settings, pipeline, signal) {
   const userMessage =
-    `영상 제목: ${title}\n영상 URL: https://www.youtube.com/watch?v=${videoId}\n\n` +
-    `<transcript>\n${renderTranscriptForPrompt(segments)}\n</transcript>`;
-  return callClaude(settings, SYSTEM_PROMPT, userMessage, signal);
+    `영상 제목: ${pipeline.title}\n영상 URL: ${pipeline.url}\n\n` +
+    `<transcript>\n${renderTranscriptForPrompt(pipeline.segments)}\n</transcript>`;
+  return callClaude(settings, ANALYSIS_SYSTEM, userMessage, signal);
 }
 
 // ---------- Obsidian 저장 ----------
 
-async function saveViaRestApi(settings, filename, content) {
+function obsidianAuthKey(settings) {
+  // 플러그인 설정 화면의 "Bearer <키>" 표기를 통째로 복사하는 경우 흡수
+  return settings.obsidianApiKey.trim().replace(/^bearer\s+/i, "");
+}
+
+async function noteExists(settings, notePath) {
   const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
-  const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
-  const notePath = folder ? `${folder}/${filename}.md` : `${filename}.md`;
   const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
+  try {
+    const resp = await fetch(`${base}/vault/${encodedPath}`, {
+      headers: { Authorization: `Bearer ${obsidianAuthKey(settings)}` },
+    });
+    return resp.ok;
+  } catch (_) {
+    return false;
+  }
+}
 
-  // 플러그인 설정 화면의 "Bearer <키>" 표기를 통째로 복사해 넣는 경우가
-  // 흔하므로, 접두어와 앞뒤 공백을 제거해 순수 키만 사용한다.
-  const apiKey = settings.obsidianApiKey.trim().replace(/^bearer\s+/i, "");
-
+async function putNote(settings, notePath, content) {
+  const base = settings.obsidianBaseUrl.replace(/\/+$/, "");
+  const encodedPath = notePath.split("/").map(encodeURIComponent).join("/");
   const resp = await fetch(`${base}/vault/${encodedPath}`, {
     method: "PUT",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${obsidianAuthKey(settings)}`,
       "Content-Type": "text/markdown",
     },
     body: content,
@@ -243,84 +267,79 @@ async function saveViaRestApi(settings, filename, content) {
     }
     throw new Error(`Obsidian REST API 오류 (HTTP ${resp.status})`);
   }
-  return notePath;
 }
 
 async function saveViaDownload(filename, content) {
   const url = "data:text/markdown;charset=utf-8," + encodeURIComponent(content);
-  await chrome.downloads.download({
-    url,
-    filename: `${filename}.md`,
-    saveAs: true,
-  });
+  await chrome.downloads.download({ url, filename: `${filename}.md`, saveAs: true });
   return `(다운로드) ${filename}.md`;
 }
 
-// ---------- 파이프라인: 브라우저 자막 경로 ----------
+/** 파이프라인 상태로 노트를 만들어 저장(또는 갱신)하고 경로를 돌려준다. */
+async function savePipelineNote(settings, pipeline) {
+  const note = buildNote({
+    videoId: pipeline.videoId,
+    title: pipeline.title,
+    url: pipeline.url,
+    segments: pipeline.segments,
+    language: pipeline.language,
+    source: pipeline.source,
+    analysis: pipeline.analysis,
+  });
+  const filename = sanitizeFilename(pipeline.title);
 
-async function runBrowserPipeline(settings, { tabId, videoId, doAnalysis, doPolish }, signal) {
-  await setJob({ detail: "자막 추출 중...", progress: 8, progressCap: 20, etaSeconds: 8 });
+  if (!settings.obsidianApiKey) {
+    return saveViaDownload(filename, note);
+  }
+
+  let notePath = pipeline.notePath;
+  if (!notePath) {
+    // 첫 저장: 기존 노트를 덮어쓰지 않도록 빈 경로를 찾는다.
+    const folder = settings.obsidianFolder.replace(/^\/+|\/+$/g, "");
+    const makePath = (name) => (folder ? `${folder}/${name}.md` : `${name}.md`);
+    notePath = makePath(filename);
+    for (let n = 2; (await noteExists(settings, notePath)) && n < 20; n++) {
+      notePath = makePath(`${filename} (${n})`);
+    }
+  }
+  await putNote(settings, notePath, note);
+  pipeline.notePath = notePath;
+  return notePath;
+}
+
+// ---------- 단계들 ----------
+
+async function stepExtract(settings, { tabId, videoId }, signal) {
+  await setJob({ detail: "자막 추출 중...", progress: 10, progressCap: 40, etaSeconds: 8 });
   const languages = settings.languages.split(",").map((s) => s.trim()).filter(Boolean);
   const extracted = await extractViaContentScript(tabId, videoId, languages);
   if (!extracted?.ok) throw new Error(extracted?.error || "자막 추출 실패");
   throwIfAborted(signal);
 
   const { title, language, source } = extracted.result;
-  // 이후 단계는 30초 문단 기준으로 처리 (교정 단위 = 노트 문단 = 분석 입력)
-  let segments = groupSegments(extracted.result.segments, 30);
-  const totalChars = segments.reduce((n, s) => n + s.text.length, 0);
-  await setJob({
+  const segments = groupSegments(extracted.result.segments); // 20초 + 화자 전환 문단
+  const pipeline = {
+    videoId,
     title,
-    detail: `자막 ${segments.length}개 문단 추출 완료.`,
-    progress: 22,
-    progressCap: 24,
-  });
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    language,
+    source,
+    segments,
+    analysis: null,
+    notePath: null,
+    polished: false,
+  };
 
-  if (doPolish) {
-    const chunkCount = Math.max(1, Math.ceil(totalChars / 9000));
-    await setJob({
-      detail: "자막 교정 중 (Claude)...",
-      progress: 25,
-      progressCap: 55,
-      etaSeconds: chunkCount * 45,
-    });
-    segments = await polishTranscript(settings, segments, signal, (done, total) => {
-      if (total > 1) setJob({ detail: `자막 교정 중 (Claude)... ${done}/${total}` });
-    });
-  }
-  throwIfAborted(signal);
-
-  let analysis = null;
-  if (doAnalysis) {
-    // 분석 시간은 자막 길이에 대략 비례한다 — 예상치를 자막 분량으로 계산.
-    const analysisEta = Math.round(35 + totalChars / 2500);
-    await setJob({
-      detail: "Claude 분석 중...",
-      progress: 60,
-      progressCap: 88,
-      etaSeconds: analysisEta,
-    });
-    analysis = await analyzeWithClaude(settings, { videoId, title, segments }, signal);
-  }
-  throwIfAborted(signal);
-
-  await setJob({ detail: "노트 생성 및 저장 중...", progress: 92, progressCap: 96, etaSeconds: 4 });
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const note = buildNote({ videoId, title, url, segments, language, source, analysis });
-  const filename = sanitizeFilename(title);
-
-  const savedTo = settings.obsidianApiKey
-    ? await saveViaRestApi(settings, filename, note)
-    : await saveViaDownload(filename, note);
-  return { savedTo, analyzed: Boolean(analysis), title };
+  await setJob({ title, detail: "노트 저장 중...", progress: 70, progressCap: 95, etaSeconds: 4 });
+  const savedTo = await savePipelineNote(settings, pipeline);
+  await setPipeline(pipeline);
+  return { savedTo, title };
 }
 
-// ---------- 파이프라인: Whisper(로컬 서버) 경로 ----------
-
-async function runServerPipeline(settings, { videoId, doAnalysis }, signal) {
+async function stepWhisper(settings, { videoId }, signal) {
   const base = settings.serverUrl.replace(/\/+$/, "");
 
-  await setJob({ detail: "로컬 서버에 작업 요청 중..." });
+  await setJob({ detail: "로컬 서버에 작업 요청 중...", progress: 5, progressCap: 10, etaSeconds: 5 });
   let resp;
   try {
     resp = await fetch(`${base}/jobs`, {
@@ -330,9 +349,10 @@ async function runServerPipeline(settings, { videoId, doAnalysis }, signal) {
       body: JSON.stringify({
         url: `https://www.youtube.com/watch?v=${videoId}`,
         use_whisper: true,
-        do_analysis: doAnalysis,
+        do_analysis: false,
+        save: false,
+        return_segments: true,
         whisper_model: settings.whisperModel || "small",
-        model: settings.model || DEFAULT_MODEL,
       }),
     });
   } catch (e) {
@@ -343,28 +363,21 @@ async function runServerPipeline(settings, { videoId, doAnalysis }, signal) {
   }
   if (!resp.ok) throw new Error(`서버 오류 (HTTP ${resp.status})`);
   const { job_id: jobId } = await resp.json();
-  if (activeRun) activeRun.serverJob = { base, jobId }; // 중지 시 서버에도 전달
+  if (activeRun) activeRun.serverJob = { base, jobId };
 
+  let job;
   let lastDetail = null;
   while (true) {
     throwIfAborted(signal);
     await sleep(2000);
-    const job = await (await fetch(`${base}/jobs/${jobId}`, { signal })).json();
+    job = await (await fetch(`${base}/jobs/${jobId}`, { signal })).json();
+    if (job.status === "done") break;
     if (job.status === "cancelled") {
       const e = new Error("사용자가 중지했습니다.");
       e.name = "AbortError";
       throw e;
     }
-    if (job.status === "done") {
-      return {
-        savedTo: job.result.saved_to,
-        analyzed: job.result.analyzed,
-        title: job.result.title,
-      };
-    }
     if (job.status === "error") throw new Error(job.error);
-    // 같은 단계에서 반복 갱신하면 팝업의 경과 시간 계산이 초기화되므로,
-    // 서버가 보내는 단계 정보가 바뀌었을 때만 기록한다.
     if (job.detail !== lastDetail) {
       lastDetail = job.detail;
       await setJob({
@@ -375,46 +388,126 @@ async function runServerPipeline(settings, { videoId, doAnalysis }, signal) {
       });
     }
   }
+
+  const result = job.result;
+  const segments = groupSegments(result.segments || []);
+  if (segments.length === 0) throw new Error("음성 인식 결과가 비어 있습니다.");
+
+  const pipeline = {
+    videoId,
+    title: result.title,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    language: result.language,
+    source: result.source,
+    segments,
+    analysis: null,
+    notePath: null,
+    polished: false,
+  };
+
+  await setJob({ title: result.title, detail: "노트 저장 중...", progress: 92, progressCap: 97, etaSeconds: 4 });
+  const savedTo = await savePipelineNote(settings, pipeline);
+  await setPipeline(pipeline);
+  return { savedTo, title: result.title };
+}
+
+async function stepPolish(settings, signal) {
+  const pipeline = await getPipeline();
+  if (!pipeline) throw new Error("먼저 ① 추출을 실행하세요.");
+
+  const totalChars = pipeline.segments.reduce((n, s) => n + s.text.length, 0);
+  const chunkCount = Math.max(1, Math.ceil(totalChars / 9000));
+  await setJob({
+    title: pipeline.title,
+    detail: "자막 교정 중 (Claude)...",
+    progress: 8,
+    progressCap: 85,
+    etaSeconds: chunkCount * 45,
+  });
+
+  pipeline.segments = await polishTranscript(
+    settings,
+    pipeline.title,
+    pipeline.segments,
+    signal,
+    (done, total) => {
+      if (total > 1) setJob({ detail: `자막 교정 중 (Claude)... ${done}/${total}` });
+    }
+  );
+  pipeline.polished = true;
+
+  await setJob({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
+  const savedTo = await savePipelineNote(settings, pipeline);
+  await setPipeline(pipeline);
+  return { savedTo, title: pipeline.title };
+}
+
+async function stepAnalyze(settings, signal) {
+  const pipeline = await getPipeline();
+  if (!pipeline) throw new Error("먼저 ① 추출을 실행하세요.");
+
+  const totalChars = pipeline.segments.reduce((n, s) => n + s.text.length, 0);
+  await setJob({
+    title: pipeline.title,
+    detail: "Claude 분석 중...",
+    progress: 8,
+    progressCap: 85,
+    etaSeconds: Math.round(35 + totalChars / 2500),
+  });
+
+  pipeline.analysis = await analyzeTranscript(settings, pipeline, signal);
+
+  await setJob({ detail: "노트 갱신 중...", progress: 90, progressCap: 96, etaSeconds: 3 });
+  const savedTo = await savePipelineNote(settings, pipeline);
+  await setPipeline(pipeline);
+  return { savedTo, title: pipeline.title };
 }
 
 // ---------- 진입점 ----------
 
-async function startPipeline(payload) {
-  if (activeRun) return; // 파이프라인은 한 번에 하나만
+const STEP_LABEL = {
+  extract: "① 자막 추출",
+  whisper: "① 음성 인식 (Whisper)",
+  polish: "② 자막 교정",
+  analyze: "③ Claude 분석",
+};
+
+async function runStep(step, payload) {
+  if (activeRun) return; // 한 번에 한 단계만
 
   const abort = new AbortController();
   activeRun = { abort, serverJob: null };
 
   const settings = await getSettings();
-  await chrome.storage.local.set({
-    lastJob: {
-      state: "running",
-      videoId: payload.videoId,
-      title: null,
-      detail: "시작 중...",
-      progress: 3,
-      progressCap: 8,
-      etaSeconds: payload.useWhisper ? 300 : 60,
-      result: null,
-      error: null,
-      updatedAt: Date.now(),
-      stageStartedAt: Date.now(),
-    },
+  await setJob({
+    state: "running",
+    step,
+    stepLabel: STEP_LABEL[step] || step,
+    detail: "시작 중...",
+    progress: 3,
+    progressCap: 8,
+    etaSeconds: step === "whisper" ? 300 : 30,
+    result: null,
+    error: null,
   });
 
   try {
-    const result = payload.useWhisper
-      ? await runServerPipeline(settings, payload, abort.signal)
-      : await runBrowserPipeline(settings, payload, abort.signal);
+    let result;
+    if (step === "extract") result = await stepExtract(settings, payload, abort.signal);
+    else if (step === "whisper") result = await stepWhisper(settings, payload, abort.signal);
+    else if (step === "polish") result = await stepPolish(settings, abort.signal);
+    else if (step === "analyze") result = await stepAnalyze(settings, abort.signal);
+    else throw new Error(`알 수 없는 단계: ${step}`);
+
     await setJob({ state: "done", detail: "완료", result, progress: 100, etaSeconds: 0 });
-    notifyUser("YouTube → Obsidian 완료", `저장됨: ${result.savedTo}`);
+    notifyUser(`${STEP_LABEL[step]} 완료`, `저장됨: ${result.savedTo}`);
   } catch (e) {
     if (e.name === "AbortError" || abort.signal.aborted) {
       await setJob({ state: "cancelled", detail: "중지됨" });
       notifyUser("YouTube → Obsidian", "작업을 중지했습니다.");
     } else {
       await setJob({ state: "error", error: e.message });
-      notifyUser("YouTube → Obsidian 오류", e.message);
+      notifyUser(`${STEP_LABEL[step]} 오류`, e.message);
     }
   } finally {
     activeRun = null;
@@ -423,8 +516,7 @@ async function startPipeline(payload) {
 
 async function cancelPipeline() {
   if (!activeRun) {
-    // 확장 새로고침/브라우저 재시작으로 실행 주체가 사라진 '유령 작업' 정리:
-    // 화면에 실행 중으로 남아 있으면 즉시 중지 상태로 바꾼다.
+    // 확장 새로고침/브라우저 재시작으로 실행 주체가 사라진 '유령 작업' 정리
     const { lastJob } = await chrome.storage.local.get("lastJob");
     if (lastJob?.state === "running") {
       await setJob({ state: "cancelled", detail: "중지됨" });
@@ -434,7 +526,6 @@ async function cancelPipeline() {
   const { abort, serverJob } = activeRun;
   abort.abort();
   if (serverJob) {
-    // 서버 쪽 작업도 중지 요청 (실패해도 무시 — 폴링은 이미 멈춤)
     fetch(`${serverJob.base}/jobs/${serverJob.jobId}/cancel`, { method: "POST" }).catch(
       () => {}
     );
@@ -442,8 +533,8 @@ async function cancelPipeline() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "startPipeline") {
-    startPipeline(message.payload); // 팝업이 닫혀도 계속 진행
+  if (message?.type === "runStep") {
+    runStep(message.step, message.payload); // 팝업이 닫혀도 계속 진행
     sendResponse({ ok: true });
     return false;
   }

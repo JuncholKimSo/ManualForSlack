@@ -24,36 +24,57 @@ def timestamp_link(video_id: str, seconds: float) -> str:
     return f"[{label}]({url})"
 
 
-def group_segments(segments: list[Segment], window: float = 30.0) -> list[Segment]:
-    """자막 조각을 window(초) 단위 문단으로 묶어 읽기 좋게 만든다."""
-    if not segments:
+import re as _re
+
+
+def split_speaker_turns(segments: list[Segment]) -> list[tuple[Segment, bool]]:
+    """자동 자막의 화자 전환 표시('>>')를 제거하고 (조각, 화자전환여부)로 펼친다."""
+    out: list[tuple[Segment, bool]] = []
+    for seg in segments:
+        raw = seg.text.replace("\n", " ")
+        starts_with_marker = bool(_re.match(r"^\s*>>", raw))
+        parts = [p.strip() for p in _re.split(r"\s*>>\s*", raw) if p.strip()]
+        for i, part in enumerate(parts):
+            new_speaker = i > 0 or (i == 0 and starts_with_marker)
+            out.append(
+                (Segment(start=seg.start, duration=seg.duration, text=part), new_speaker)
+            )
+    return out
+
+
+def group_segments(segments: list[Segment], window: float = 20.0) -> list[Segment]:
+    """자막 조각을 window(초) 단위 문단으로 묶는다.
+
+    화자가 바뀌는 것으로 추정되는 지점('>>')에서는 시간과 무관하게 새 문단.
+    """
+    turns = split_speaker_turns(segments)
+    if not turns:
         return []
 
     grouped: list[Segment] = []
-    current_start = segments[0].start
+    current_start = turns[0][0].start
     current_texts: list[str] = []
 
-    for seg in segments:
-        if seg.start - current_start >= window and current_texts:
+    def flush(next_start: float) -> None:
+        nonlocal current_texts
+        if current_texts:
             grouped.append(
                 Segment(
                     start=current_start,
-                    duration=seg.start - current_start,
+                    duration=next_start - current_start,
                     text=" ".join(current_texts),
                 )
             )
-            current_start = seg.start
             current_texts = []
-        current_texts.append(seg.text.replace("\n", " ").strip())
 
-    last_seg = segments[-1]
-    grouped.append(
-        Segment(
-            start=current_start,
-            duration=last_seg.start + last_seg.duration - current_start,
-            text=" ".join(current_texts),
-        )
-    )
+    for seg, new_speaker in turns:
+        if current_texts and (new_speaker or seg.start - current_start >= window):
+            flush(seg.start)
+            current_start = seg.start
+        current_texts.append(seg.text)
+
+    last_seg = turns[-1][0]
+    flush(last_seg.start + last_seg.duration)
     return grouped
 
 
@@ -62,7 +83,7 @@ def build_note(
     title: str,
     url: str,
     analysis: str | None = None,
-    group_window: float = 30.0,
+    group_window: float = 20.0,
 ) -> str:
     """frontmatter + 분석 + 타임스탬프 트랜스크립트로 구성된 노트를 만든다."""
     today = date.today().isoformat()

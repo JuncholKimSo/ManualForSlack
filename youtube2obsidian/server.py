@@ -123,25 +123,38 @@ def _run_job(job_id: str, params: dict) -> None:
                 transcript, title, model=params.get("model", DEFAULT_MODEL)
             )
 
-        _check_cancel(job_id)
-        _update(job_id, detail="노트 저장 중...", progress=93, progress_cap=97, eta_seconds=3)
-        note = build_note(transcript, title=title, url=url, analysis=analysis)
-        path = save_note(
-            note, title=title, vault=_VAULT, subfolder=params.get("subfolder", "YouTube")
-        )
+        result = {
+            "title": title,
+            "analyzed": analysis is not None,
+            "segment_count": len(transcript.segments),
+            "language": transcript.language,
+            "source": transcript.source,
+            "saved_to": None,
+        }
+
+        # 확장의 단계형 흐름: 저장은 확장이 맡고 세그먼트만 돌려받는다.
+        if params.get("return_segments"):
+            result["segments"] = [
+                {"start": s.start, "duration": s.duration, "text": s.text}
+                for s in transcript.segments
+            ]
+
+        if params.get("save", True):
+            _check_cancel(job_id)
+            _update(job_id, detail="노트 저장 중...", progress=93, progress_cap=97, eta_seconds=3)
+            note = build_note(transcript, title=title, url=url, analysis=analysis)
+            path = save_note(
+                note, title=title, vault=_VAULT, subfolder=params.get("subfolder", "YouTube")
+            )
+            result["saved_to"] = str(path)
+
         _update(
             job_id,
             status="done",
             detail="완료",
             progress=100,
             eta_seconds=0,
-            result={
-                "saved_to": str(path),
-                "title": title,
-                "analyzed": analysis is not None,
-                "segments": len(transcript.segments),
-                "source": transcript.source,
-            },
+            result=result,
         )
     except _Cancelled:
         _update(job_id, status="cancelled", detail="사용자가 중지했습니다.")

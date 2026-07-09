@@ -1,6 +1,7 @@
-// 팝업: 시작 버튼 역할만 한다. 실제 작업은 백그라운드 서비스 워커가 수행하며,
-// 진행 상태는 chrome.storage의 lastJob을 구독해 표시한다.
-// → 팝업/창을 닫아도 작업은 계속되고, 완료 시 시스템 알림이 뜬다.
+// 팝업: 단계 선택형 실행 UI.
+//   ① 추출(자막/Whisper) → ② 자막 교정(선택) → ③ Claude 분석(선택)
+// 각 단계는 백그라운드가 수행하며 같은 노트를 갱신한다.
+// 팝업/창을 닫아도 진행되고, 다시 열면 상태가 복원된다.
 
 const $ = (id) => document.getElementById(id);
 
@@ -32,7 +33,11 @@ async function getActiveYouTubeTab() {
   return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? { tab, videoId } : null;
 }
 
+// ---------- 진행 표시 ----------
+
 let currentJob = null;
+let currentPipeline = null;
+let running = false;
 
 function fmtEta(seconds) {
   const s = Math.max(0, Math.round(seconds));
@@ -41,7 +46,6 @@ function fmtEta(seconds) {
   return `약 ${s}초`;
 }
 
-/** 단계 기준 %에서 시작해, 단계 예상 시간에 맞춰 상한(cap)까지 서서히 채운다. */
 function computePct(job) {
   const base = job.progress ?? 5;
   const cap = job.progressCap ?? Math.min(base + 10, 95);
@@ -71,101 +75,116 @@ function showProgress(visible) {
   $("progress-label").style.display = visible ? "block" : "none";
 }
 
+// ---------- 상태 렌더링 ----------
+
+function renderButtons() {
+  const hasPipeline = Boolean(currentPipeline);
+  $("run-extract").disabled = running;
+  $("run-whisper").disabled = running;
+  $("run-polish").disabled = running || !hasPipeline;
+  $("run-analyze").disabled = running || !hasPipeline;
+  $("stop").style.display = running ? "block" : "none";
+}
+
+function renderPipeline() {
+  const el = $("pipeline-state");
+  if (!currentPipeline) {
+    el.textContent = "";
+    return;
+  }
+  const p = currentPipeline;
+  const mark = (done) => (done ? "✅" : "▫️");
+  el.textContent =
+    `📄 ${p.title}\n` +
+    `${mark(true)} 추출 (${p.segments.length}문단, ${p.source})  ` +
+    `${mark(p.polished)} 교정  ${mark(Boolean(p.analysis))} 분석`;
+}
+
 function renderJob(job) {
   currentJob = job;
   if (!job) return;
-  const suffix = job.title ? `\n🎬 ${job.title}` : "";
-  $("stop").style.display = job.state === "running" ? "block" : "none";
+  running = job.state === "running";
+  renderButtons();
+
+  const label = job.stepLabel ? `[${job.stepLabel}] ` : "";
   if (job.state === "running") {
-    $("run").disabled = true;
     showProgress(true);
     updateProgressUI();
-    setStatus(
-      `⏳ ${job.detail}${suffix}\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)`
-    );
+    setStatus(`⏳ ${label}${job.detail}\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)`);
   } else if (job.state === "done") {
-    $("run").disabled = false;
     showProgress(true);
     $("progress-bar").style.width = "100%";
     $("progress-label").textContent = "100%";
-    setStatus(
-      `✅ 저장 완료: ${job.result.savedTo}${job.result.analyzed ? "\n(Claude 분석 포함)" : ""}${suffix}`,
-      "success"
-    );
+    setStatus(`✅ ${label}완료 — 저장됨: ${job.result?.savedTo || ""}`, "success");
   } else if (job.state === "cancelled") {
-    $("run").disabled = false;
     showProgress(false);
     setStatus("⏹ 작업을 중지했습니다.");
   } else if (job.state === "error") {
-    $("run").disabled = false;
     showProgress(false);
     setStatus(`❌ ${job.error}`, "error");
   }
 }
 
-// 백그라운드가 갱신하는 진행 상태를 실시간 반영
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.lastJob) renderJob(changes.lastJob.newValue);
+  if (area !== "local") return;
+  if (changes.lastJob) renderJob(changes.lastJob.newValue);
+  if (changes.pipeline) {
+    currentPipeline = changes.pipeline.newValue;
+    renderPipeline();
+    renderButtons();
+  }
 });
 
-async function run() {
-  const found = await getActiveYouTubeTab();
-  if (!found) {
-    setStatus("YouTube 영상 페이지에서 실행하세요.", "error");
-    return;
+// ---------- 실행 ----------
+
+async function startStep(step) {
+  let payload = {};
+  if (step === "extract" || step === "whisper") {
+    const found = await getActiveYouTubeTab();
+    if (!found) {
+      setStatus("YouTube 영상 페이지에서 실행하세요.", "error");
+      return;
+    }
+    payload = { tabId: found.tab.id, videoId: found.videoId };
   }
 
-  const doAnalysis = $("do-analysis").checked;
-  const doPolish = $("do-polish").checked;
-  const useWhisper = $("use-whisper").checked;
-  await chrome.storage.local.set({ useWhisper, doPolish });
-
-  // 시작 신호만 보낸다 — 이후는 백그라운드가 알아서 진행.
-  chrome.runtime
-    .sendMessage({
-      type: "startPipeline",
-      payload: {
-        tabId: found.tab.id,
-        videoId: found.videoId,
-        doAnalysis,
-        doPolish,
-        useWhisper,
-      },
-    })
-    .catch(() => {});
-
-  $("run").disabled = true;
+  chrome.runtime.sendMessage({ type: "runStep", step, payload }).catch(() => {});
+  running = true;
+  renderButtons();
   showProgress(true);
   setStatus("⏳ 시작 중...\n(팝업이나 창을 닫아도 백그라운드에서 계속 진행됩니다)");
 }
 
 async function init() {
-  $("run").addEventListener("click", run);
+  $("run-extract").addEventListener("click", () => startStep("extract"));
+  $("run-whisper").addEventListener("click", () => startStep("whisper"));
+  $("run-polish").addEventListener("click", () => startStep("polish"));
+  $("run-analyze").addEventListener("click", () => startStep("analyze"));
   $("stop").addEventListener("click", () => {
     chrome.runtime.sendMessage({ type: "cancelPipeline" }).catch(() => {});
     setStatus("⏹ 중지 요청 중...");
   });
   $("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-  const { useWhisper, doPolish, lastJob } = await chrome.storage.local.get({
-    useWhisper: false,
-    doPolish: false,
+  const { lastJob, pipeline } = await chrome.storage.local.get({
     lastJob: null,
+    pipeline: null,
   });
-  $("use-whisper").checked = useWhisper;
-  $("do-polish").checked = doPolish;
+  currentPipeline = pipeline;
+  renderPipeline();
 
   const found = await getActiveYouTubeTab();
   if (found) {
     $("video-title").textContent = `🎬 ${found.tab.title?.replace(/ - YouTube$/, "") || found.videoId}`;
   } else {
     $("video-title").textContent = "YouTube 영상 페이지가 아닙니다.";
-    $("run").disabled = true;
   }
 
-  // 진행 중이거나 최근 완료된 작업 상태를 복원해서 보여준다.
-  if (lastJob && (lastJob.state === "running" || Date.now() - lastJob.updatedAt < 120_000)) {
+  // 진행 중이거나 최근 작업 상태 복원
+  if (lastJob && (lastJob.state === "running" || Date.now() - lastJob.updatedAt < 300_000)) {
     renderJob(lastJob);
+  } else {
+    renderButtons();
   }
 }
 
