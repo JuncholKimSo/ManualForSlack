@@ -350,8 +350,16 @@ async function startPipeline(payload) {
   }
 }
 
-function cancelPipeline() {
-  if (!activeRun) return;
+async function cancelPipeline() {
+  if (!activeRun) {
+    // 확장 새로고침/브라우저 재시작으로 실행 주체가 사라진 '유령 작업' 정리:
+    // 화면에 실행 중으로 남아 있으면 즉시 중지 상태로 바꾼다.
+    const { lastJob } = await chrome.storage.local.get("lastJob");
+    if (lastJob?.state === "running") {
+      await setJob({ state: "cancelled", detail: "중지됨" });
+    }
+    return;
+  }
   const { abort, serverJob } = activeRun;
   abort.abort();
   if (serverJob) {
@@ -375,3 +383,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   return false;
 });
+
+// 서비스 워커가 새로 시작됐는데 lastJob이 실행 중이면, 이전 실행 주체가
+// 사라진 것(확장 새로고침/브라우저 재시작)이므로 상태를 정리한다.
+(async () => {
+  const { lastJob } = await chrome.storage.local.get("lastJob");
+  const staleMs = Date.now() - (lastJob?.updatedAt || 0);
+  if (lastJob?.state === "running" && !activeRun && staleMs > 5000) {
+    await setJob({
+      state: "error",
+      error: "확장이 재시작되어 이전 작업이 중단되었습니다. 다시 실행해주세요.",
+    });
+  }
+})();

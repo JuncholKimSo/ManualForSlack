@@ -46,11 +46,15 @@
   <input type="password" id="anthropicApiKey" placeholder="sk-ant-..." />
   <div class="hint">이 브라우저에만 저장됩니다 (chrome.storage.local).</div>
 
-  <label for="model">모델</label>
-  <input type="text" id="model" placeholder="claude-opus-4-8" />
+  <label for="model">분석 모델</label>
+  <select id="model">
+    <option value="claude-sonnet-5">Claude Sonnet 5 — 품질·비용 균형 (추천)</option>
+    <option value="claude-opus-4-8">Claude Opus 4.8 — 최고 품질</option>
+    <option value="claude-haiku-4-5">Claude Haiku 4.5 — 최저 비용·최고 속도</option>
+  </select>
   <div class="hint">
-    비용을 줄이려면 <code>claude-haiku-4-5</code>(약 1/5 가격) 또는
-    <code>claude-sonnet-5</code>(균형)로 바꿀 수 있습니다. 분석 품질은 다소 낮아집니다.
+    영상 1개 분석 비용 대략: Haiku &lt; Sonnet(Opus의 약 60%) &lt; Opus.
+    요약·분석 용도로는 Sonnet 5로도 충분한 경우가 많습니다.
   </div>
 
   <div class="checkbox-row">
