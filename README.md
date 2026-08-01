@@ -182,6 +182,40 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## 아이폰에서 노트 보기 (Obsidian 접속 가이드)
+
+이 도구는 노트를 **컴퓨터의 Obsidian Vault 폴더**(`OBSIDIAN_VAULT_PATH`)에 저장합니다.
+아이폰에서 보려면 그 Vault를 아이폰과 **동기화**하면 됩니다. 핵심은 하나예요:
+**"Vault 폴더를 아이폰과 동기화되는 위치에 두는 것"**. 그러면 CLI/확장이 노트를
+저장할 때마다 아이폰 Obsidian 앱에서도 자동으로 보입니다.
+
+| 상황 | 추천 방법 |
+|---|---|
+| 맥 + 무료 | **iCloud Drive** |
+| 여러 기기 / PC / 확실한 동기화 | **Obsidian Sync (유료)** |
+| PC + 무료 | **Remotely Save + Dropbox** |
+
+### 1. iCloud Drive (무료, 맥 사용자 추천)
+
+1. 맥에서 Vault 폴더를 Obsidian의 iCloud 폴더
+   (`~/Library/Mobile Documents/iCloud~md~obsidian/`) 아래로 옮기거나, 처음부터 그 안에 생성
+2. 아이폰 App Store에서 **Obsidian** 앱 설치
+3. 앱에서 **"Store in iCloud"** 로 같은 Vault 열기
+4. 이 저장소의 `OBSIDIAN_VAULT_PATH`(또는 `--vault`)를 그 iCloud Vault 경로로 지정
+
+> ⚠️ 윈도우 PC에서는 iCloud Drive 동기화가 불안정할 수 있어 권장하지 않습니다.
+
+### 2. Obsidian Sync (공식 유료, 가장 안정적)
+
+- Obsidian 공식 유료 서비스. 종단간 암호화 + 충돌 처리까지 자동
+- 맥/PC와 아이폰에서 같은 Sync 계정으로 로그인 → 같은 Vault 선택
+- PC를 쓰거나 여러 기기를 확실히 동기화하려면 가장 편합니다
+
+### 3. Remotely Save + Dropbox/구글드라이브 (무료, PC 사용자용)
+
+- 데스크톱 Obsidian에 **Remotely Save** 커뮤니티 플러그인 설치 → Dropbox/S3/구글드라이브 연결
+- 아이폰 Obsidian에도 같은 플러그인 설치 후 같은 저장소 연결 → 수동/자동 동기화
+
 ## 참고 사항
 
 - **자막 vs Whisper**: 대부분의 영상은 자동 생성 자막이 있어 1차 경로로 몇 초 안에 처리됩니다.
